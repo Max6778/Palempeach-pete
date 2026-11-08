@@ -1,0 +1,155 @@
+name: decompile
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "File path in this repo (example: samples/app.apk)"
+        required: true
+      tool:
+        description: "auto, jadx, ghidra, kuna, rizin or all"
+        default: auto
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Pick tools
+        id: pick
+        run: |
+          T="${{ inputs.tool }}"
+          F="${{ inputs.target }}"
+          JADX=false; GHIDRA=false; KUNA=false; RIZIN=false; APK=false
+          case "$T" in
+            jadx) JADX=true ;;
+            ghidra) GHIDRA=true ;;
+            kuna) KUNA=true ;;
+            rizin) RIZIN=true ;;
+            all) JADX=true; GHIDRA=true; KUNA=true; RIZIN=true ;;
+            *)
+              case "${F,,}" in
+                *.apk) JADX=true; APK=true ;;
+                *.dex|*.jar|*.aab|*.class) JADX=true ;;
+                *) GHIDRA=true; KUNA=true; RIZIN=true ;;
+              esac ;;
+          esac
+          case "${F,,}" in *.apk) APK=true ;; esac
+          { echo "jadx=$JADX"; echo "ghidra=$GHIDRA"; echo "kuna=$KUNA"; echo "rizin=$RIZIN"; echo "apk=$APK"; } >> "$GITHUB_OUTPUT"
+          mkdir -p out
+
+      # Always runs: file type, strings, headers and engine hints
+      - name: Info
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rizin binutils file || sudo apt-get install -y -qq binutils file
+          mkdir -p out/info
+          F="${{ inputs.target }}"
+          file "$F" > out/info/file.txt
+          strings -n 8 "$F" | head -n 30000 > out/info/strings.txt
+          objdump -x "$F" > out/info/headers.txt 2>&1 || true
+          if command -v rz-bin >/dev/null; then
+            rz-bin -I "$F" > out/info/rz-info.txt 2>&1 || true
+            rz-bin -i "$F" > out/info/imports.txt 2>&1 || true
+            rz-bin -l "$F" > out/info/libraries.txt 2>&1 || true
+          fi
+          grep -aiE "haxe|openfl|lime|heaps|flixel|unity|mono|il2cpp|godot|unreal|gamemaker|love2d|sdl|monogame|xna|electron|nw\.js|adobe air|flash|steam_api|cocos|defold|raylib" out/info/strings.txt out/info/imports.txt out/info/libraries.txt 2>/dev/null | head -n 300 > out/info/engine-hints.txt || true
+
+      - name: JADX
+        if: steps.pick.outputs.jadx == 'true'
+        continue-on-error: true
+        run: |
+          wget -q https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip
+          unzip -q jadx-1.5.6.zip -d jadx
+          mkdir -p out/jadx
+          ./jadx/bin/jadx -d out/jadx "${{ inputs.target }}" || true
+
+      - name: Apktool
+        if: steps.pick.outputs.apk == 'true'
+        continue-on-error: true
+        run: |
+          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O apktool.jar
+          java -jar apktool.jar d -f -o out/apktool "${{ inputs.target }}"
+
+      - name: Ghidra
+        if: steps.pick.outputs.ghidra == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          URL=$(gh api repos/NationalSecurityAgency/ghidra/releases/latest --jq '.assets[] | select(.name|endswith(".zip")) | .browser_download_url' | head -1)
+          wget -q "$URL" -O ghidra.zip
+          unzip -q ghidra.zip -d ghidra
+          HEADLESS=$(find ghidra -name analyzeHeadless -type f | head -1)
+          mkdir -p out/ghidra gproj
+          "$HEADLESS" gproj p -import "${{ inputs.target }}" \
+            -scriptPath ghidra_scripts \
+            -postScript DecompileAll.java "$PWD/out/ghidra/decompiled.c" \
+            -deleteProject
+
+      - name: Kuna
+        if: steps.pick.outputs.kuna == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/Noelo-Lab/kuna/releases/latest > rel.json
+          echo "Kuna assets:"; jq -r '.assets[].name' rel.json
+          BIN_URL=$(jq -r '.assets[] | select(.name|test("linux";"i")) | select(.name|test("x86_64|amd64|x64";"i")) | select(.name|test("specs|ghidra";"i")|not) | .browser_download_url' rel.json | head -1)
+          SPECS_URL=$(jq -r '.assets[] | select(.name|test("specs";"i")) | select(.name|test("ghidra";"i")|not) | .browser_download_url' rel.json | head -1)
+          [ -n "$BIN_URL" ] || { echo "No Linux x86_64 Kuna asset found"; exit 1; }
+          mkdir -p kuna-bin kuna-specs
+          wget -q "$BIN_URL" -O kuna-bin/pkg
+          case "$BIN_URL" in
+            *.zip) unzip -q kuna-bin/pkg -d kuna-bin ;;
+            *) tar -xzf kuna-bin/pkg -C kuna-bin ;;
+          esac
+          KUNA=$(find kuna-bin -type f -name kuna | head -1)
+          chmod +x "$KUNA"
+          if [ -n "$SPECS_URL" ]; then
+            wget -q "$SPECS_URL" -O specs.tgz
+            tar -xzf specs.tgz -C kuna-specs
+            SP=$(find kuna-specs -type d -name specs | head -1)
+            export KUNA_SPECS="${SP:-$PWD/kuna-specs}"
+          fi
+          mkdir -p out/kuna
+          cp "${{ inputs.target }}" out/kuna/
+          cd out/kuna
+          "$GITHUB_WORKSPACE/$KUNA" decompile-project "$(basename "${{ inputs.target }}")"
+
+      - name: Rizin (functions and disassembly)
+        if: steps.pick.outputs.rizin == 'true'
+        continue-on-error: true
+        run: |
+          command -v rizin >/dev/null || sudo apt-get install -y -qq rizin
+          mkdir -p out/rizin
+          rizin -q -c 'aaa; afl' "${{ inputs.target }}" > out/rizin/functions.txt 2>&1 || true
+          rizin -q -c 'aaa; pdf @ entry0' "${{ inputs.target }}" > out/rizin/entry.txt 2>&1 || true
+          rizin -q -c 'izz' "${{ inputs.target }}" | head -n 50000 > out/rizin/all-strings.txt 2>&1 || true
+
+      # Only produces output for .NET programs
+      - name: ILSpy (.NET)
+        if: steps.pick.outputs.ghidra == 'true'
+        continue-on-error: true
+        run: |
+          if grep -qi "Mono/.Net\|PE32.*Mono" out/info/file.txt; then
+            dotnet tool install -g ilspycmd
+            export PATH="$PATH:$HOME/.dotnet/tools"
+            mkdir -p out/ilspy
+            ilspycmd -p -o out/ilspy "${{ inputs.target }}"
+          else
+            echo "Not a .NET file, skipping"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result
+          path: out/
+          if-no-files-found: warn
