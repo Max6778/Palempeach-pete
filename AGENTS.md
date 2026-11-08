@@ -5,7 +5,7 @@ To analyze a file (APK, DEX, JAR, .so, ELF, .exe, .dll):
     ./decompile.sh /full/path/to/file [auto|jadx|ghidra|kuna|rizin|all] [--full]
 
 RULES (saves tokens):
-1. This only STARTS the job in the background. After it prints STARTED, STOP.
+1. This starts the job on GitHub (STARTED is printed only after GitHub confirms the run). After STARTED, STOP.
    Reply with one short sentence ("Started. Tell me when it is finished.").
    Do NOT poll, sleep, watch, or check status.
 2. When the user says it is done, run: ./decompile.sh result

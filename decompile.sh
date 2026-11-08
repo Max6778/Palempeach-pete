@@ -6,6 +6,7 @@
 #   ./decompile.sh status                                            list jobs
 #
 # Everything else (upload, big files, workflow, cached tools, download) is automatic.
+# STARTED is only printed after GitHub confirms a real run exists.
 # If a token is needed, log in once with: gh auth login   (or export GH_TOKEN=...)
 set -e
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; cd "$HERE"
@@ -27,14 +28,14 @@ finish() { # key : download the result of a finished run
   fi
 }
 
-cmd_run() { # internal, runs in background: key file tool full
-  local KEY="$1" FILE="$2" TOOL="$3" FULL="$4"
-  command -v termux-wake-lock >/dev/null && termux-wake-lock || true
+upload_and_trigger() { # key file tool : upload, start the workflow, record the REAL run id
+  local KEY="$1" FILE="$2" TOOL="$3"
   local SHA8 NAME SIZE TARGET RUN
   SHA8=$(sha256sum "$FILE" | cut -c1-8)
   NAME="${SHA8}_$(basename "$FILE" | tr ' ' '_')"
   SIZE=$(stat -c %s "$FILE")
   if [ "$SIZE" -gt 94371840 ]; then
+    [ "$SIZE" -gt 2000000000 ] && { echo "Over 2 GB: too big for GitHub releases."; state_set "$KEY" STATE failed; return 1; }
     gh release view big-samples >/dev/null 2>&1 || gh release create big-samples --title big-samples --notes "Large files for decompile workflow" >/dev/null
     if gh release view big-samples --json assets --jq '.assets[].name' | grep -qx "$NAME"; then
       echo "Already uploaded."
@@ -53,15 +54,26 @@ cmd_run() { # internal, runs in background: key file tool full
     git push -q
     TARGET="samples/$NAME"
   fi
-  state_set "$KEY" STATE running
+  local BEFORE; BEFORE=$(gh run list --workflow decompile.yml -L1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo 0)
   gh workflow run decompile.yml -f target="$TARGET" -f tool="$TOOL"
-  sleep 8
-  RUN=$(gh run list --workflow decompile.yml -L1 --json databaseId --jq '.[0].databaseId')
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 3
+    RUN=$(gh run list --workflow decompile.yml -L1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo 0)
+    [ -n "$RUN" ] && [ "$RUN" != "$BEFORE" ] && break
+    RUN=""
+  done
+  if [ -z "$RUN" ]; then
+    echo "ERROR: GitHub did not start a new run. Is the workflow file pushed to the repo?"
+    state_set "$KEY" STATE failed; return 1
+  fi
   state_set "$KEY" RUN "$RUN"
-  gh run watch "$RUN" --exit-status >/dev/null 2>&1 || true
-  finish "$KEY"
-  command -v termux-notification >/dev/null && termux-notification --title "Decompile finished" --content "$KEY - tell the agent it is done" || true
-  command -v termux-wake-unlock >/dev/null && termux-wake-unlock || true
+  state_set "$KEY" STATE running
+  echo "GitHub run started: $RUN"
+}
+
+cmd_run() { # internal: detached upload for big files
+  upload_and_trigger "$@"
 }
 
 cmd_start() {
@@ -78,17 +90,35 @@ cmd_start() {
     echo "CACHED: this file was already analyzed with this tool. No waiting needed."
     cat "$OUT/summary.md"; exit 0
   fi
-  if [ -f "jobs/$KEY.state" ] && grep -qE '^STATE=(uploading|running)' "jobs/$KEY.state"; then
-    echo "ALREADY RUNNING: $KEY. STOP and wait for the user to say it is done."; exit 0
+  if [ -f "jobs/$KEY.state" ]; then
+    . "jobs/$KEY.state"
+    if [ "$STATE" = running ] && [ -n "${RUN:-}" ] && [ "$(gh run view "$RUN" --json status --jq .status 2>/dev/null)" != completed ]; then
+      echo "ALREADY RUNNING on GitHub (run $RUN). STOP and wait for the user to say it is done."; exit 0
+    fi
   fi
   rm -f "jobs/$KEY.state"
   state_set "$KEY" STATE uploading
   state_set "$KEY" OUT "$OUT"
   state_set "$KEY" FULL "$FULL"
-  nohup bash "$HERE/decompile.sh" _run "$KEY" "$(readlink -f "$FILE")" "$TOOL" "$FULL" > "jobs/$KEY.log" 2>&1 < /dev/null &
-  disown 2>/dev/null || true
-  echo "STARTED: $KEY (tool: $TOOL)"
-  echo "It uploads to GitHub and runs in the background."
+  local SIZE; SIZE=$(stat -c %s "$FILE")
+  if [ "$SIZE" -gt 94371840 ]; then
+    # big file: upload may take minutes, so detach it (needs setsid: pkg install util-linux)
+    if command -v setsid >/dev/null; then
+      setsid -f bash "$HERE/decompile.sh" _run "$KEY" "$(readlink -f "$FILE")" "$TOOL" > "jobs/$KEY.log" 2>&1 < /dev/null
+      sleep 4
+      if ! pgrep -f "decompile.sh _run $KEY" >/dev/null && ! grep -q '^STATE=running' "jobs/$KEY.state"; then
+        echo "ERROR: the background upload died right away. Log:"; cat "jobs/$KEY.log"; exit 1
+      fi
+      echo "STARTED: $KEY. Big file: uploading in the background, then GitHub runs it."
+    else
+      echo "No setsid found, uploading in the foreground (may take a while). Tip: pkg install util-linux"
+      upload_and_trigger "$KEY" "$(readlink -f "$FILE")" "$TOOL" || exit 1
+      echo "STARTED: $KEY (GitHub is running it)."
+    fi
+  else
+    upload_and_trigger "$KEY" "$(readlink -f "$FILE")" "$TOOL" || exit 1
+    echo "STARTED: $KEY (GitHub is running it)."
+  fi
   echo "AGENT: STOP NOW. Do not poll, sleep, or check status. Reply to the user with ONE short sentence:"
   echo "  'Started. Tell me when it is finished.'"
   echo "When the user says it is done, run: ./decompile.sh result"
@@ -105,6 +135,9 @@ cmd_result() {
   if [ "$STATE" != done ] && [ -n "${RUN:-}" ]; then
     # background watcher may have been killed by Android: check GitHub directly
     if [ "$(gh run view "$RUN" --json status --jq .status 2>/dev/null)" = completed ]; then finish "$KEY"; . "jobs/$KEY.state"; fi
+  fi
+  if [ "$STATE" = uploading ] && ! pgrep -f "decompile.sh _run $KEY" >/dev/null; then
+    state_set "$KEY" STATE failed; STATE=failed
   fi
   case "$STATE" in
     done) cat "$OUT/summary.md"; echo; echo "Saved in: $HERE/$OUT"
