@@ -44,6 +44,21 @@ jobs:
           { echo "jadx=$JADX"; echo "ghidra=$GHIDRA"; echo "kuna=$KUNA"; echo "rizin=$RIZIN"; echo "apk=$APK"; } >> "$GITHUB_OUTPUT"
           mkdir -p out
 
+      - name: Fetch target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          T="${{ inputs.target }}"
+          case "$T" in
+            release:*)
+              NAME="${T#release:}"
+              mkdir -p samples
+              gh release download big-samples -p "$NAME" -D samples --clobber
+              echo "TARGET=samples/$NAME" >> "$GITHUB_ENV" ;;
+            *)
+              echo "TARGET=$T" >> "$GITHUB_ENV" ;;
+          esac
+
       # Always runs: file type, strings, headers and engine hints
       - name: Info
         continue-on-error: true
@@ -51,7 +66,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq rizin binutils file || sudo apt-get install -y -qq binutils file
           mkdir -p out/info
-          F="${{ inputs.target }}"
+          F="$TARGET"
           file "$F" > out/info/file.txt
           strings -n 8 "$F" | head -n 30000 > out/info/strings.txt
           objdump -x "$F" > out/info/headers.txt 2>&1 || true
@@ -69,14 +84,15 @@ jobs:
           wget -q https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip
           unzip -q jadx-1.5.6.zip -d jadx
           mkdir -p out/jadx
-          ./jadx/bin/jadx -d out/jadx "${{ inputs.target }}" || true
+          export JADX_OPTS="-Xmx10g"
+          ./jadx/bin/jadx -d out/jadx "$TARGET" || true
 
       - name: Apktool
         if: steps.pick.outputs.apk == 'true'
         continue-on-error: true
         run: |
           wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O apktool.jar
-          java -jar apktool.jar d -f -o out/apktool "${{ inputs.target }}"
+          java -jar apktool.jar d -f -o out/apktool "$TARGET"
 
       - name: Ghidra
         if: steps.pick.outputs.ghidra == 'true'
@@ -89,7 +105,7 @@ jobs:
           unzip -q ghidra.zip -d ghidra
           HEADLESS=$(find ghidra -name analyzeHeadless -type f | head -1)
           mkdir -p out/ghidra gproj
-          "$HEADLESS" gproj p -import "${{ inputs.target }}" \
+          "$HEADLESS" gproj p -import "$TARGET" \
             -scriptPath ghidra_scripts \
             -postScript DecompileAll.java "$PWD/out/ghidra/decompiled.c" \
             -deleteProject
@@ -120,9 +136,10 @@ jobs:
             export KUNA_SPECS="${SP:-$PWD/kuna-specs}"
           fi
           mkdir -p out/kuna
-          cp "${{ inputs.target }}" out/kuna/
+          cp "$TARGET" out/kuna/
           cd out/kuna
-          "$GITHUB_WORKSPACE/$KUNA" decompile-project "$(basename "${{ inputs.target }}")"
+          "$GITHUB_WORKSPACE/$KUNA" decompile-project "$(basename "$TARGET")" || true
+          rm -f "$(basename "$TARGET")"
 
       - name: Rizin (functions and disassembly)
         if: steps.pick.outputs.rizin == 'true'
@@ -130,9 +147,9 @@ jobs:
         run: |
           command -v rizin >/dev/null || sudo apt-get install -y -qq rizin
           mkdir -p out/rizin
-          rizin -q -c 'aaa; afl' "${{ inputs.target }}" > out/rizin/functions.txt 2>&1 || true
-          rizin -q -c 'aaa; pdf @ entry0' "${{ inputs.target }}" > out/rizin/entry.txt 2>&1 || true
-          rizin -q -c 'izz' "${{ inputs.target }}" | head -n 50000 > out/rizin/all-strings.txt 2>&1 || true
+          rizin -q -c 'aaa; afl' "$TARGET" > out/rizin/functions.txt 2>&1 || true
+          rizin -q -c 'aaa; pdf @ entry0' "$TARGET" > out/rizin/entry.txt 2>&1 || true
+          rizin -q -c 'izz' "$TARGET" | head -n 50000 > out/rizin/all-strings.txt 2>&1 || true
 
       # Only produces output for .NET programs
       - name: ILSpy (.NET)
@@ -143,7 +160,7 @@ jobs:
             dotnet tool install -g ilspycmd
             export PATH="$PATH:$HOME/.dotnet/tools"
             mkdir -p out/ilspy
-            ilspycmd -p -o out/ilspy "${{ inputs.target }}"
+            ilspycmd -p -o out/ilspy "$TARGET"
           else
             echo "Not a .NET file, skipping"
           fi
