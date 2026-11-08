@@ -3,26 +3,23 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: "File path in this repo (example: samples/app.apk)"
+        description: "File path in this repo, or release:NAME for big files"
         required: true
       tool:
-        description: "auto, jadx, ghidra, kuna, rizin or all"
+        description: "auto (fast), jadx, ghidra, kuna, rizin or all"
         default: auto
 
 jobs:
-  run:
+  plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    outputs:
+      jadx: ${{ steps.pick.outputs.jadx }}
+      apk: ${{ steps.pick.outputs.apk }}
+      ghidra: ${{ steps.pick.outputs.ghidra }}
+      kuna: ${{ steps.pick.outputs.kuna }}
+      rizin: ${{ steps.pick.outputs.rizin }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-
-      - name: Pick tools
-        id: pick
+      - id: pick
         run: |
           T="${{ inputs.tool }}"
           F="${{ inputs.target }}"
@@ -34,126 +31,51 @@ jobs:
             rizin) RIZIN=true ;;
             all) JADX=true; GHIDRA=true; KUNA=true; RIZIN=true ;;
             *)
+              # auto = fast tools only. Ghidra is slow, ask for it explicitly.
               case "${F,,}" in
                 *.apk) JADX=true; APK=true ;;
                 *.dex|*.jar|*.aab|*.class) JADX=true ;;
-                *) GHIDRA=true; KUNA=true; RIZIN=true ;;
+                *) KUNA=true; RIZIN=true ;;
               esac ;;
           esac
           case "${F,,}" in *.apk) APK=true ;; esac
           { echo "jadx=$JADX"; echo "ghidra=$GHIDRA"; echo "kuna=$KUNA"; echo "rizin=$RIZIN"; echo "apk=$APK"; } >> "$GITHUB_OUTPUT"
-          mkdir -p out
 
+  info:
+    needs: plan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
       - name: Fetch target
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          T="${{ inputs.target }}"
-          case "$T" in
-            release:*)
-              NAME="${T#release:}"
-              mkdir -p samples
-              gh release download big-samples -p "$NAME" -D samples --clobber
-              echo "TARGET=samples/$NAME" >> "$GITHUB_ENV" ;;
-            *)
-              echo "TARGET=$T" >> "$GITHUB_ENV" ;;
-          esac
-
-      # Always runs: file type, strings, headers and engine hints
+          TARGET_INPUT: ${{ inputs.target }}
+        run: bash scripts/fetch-target.sh
       - name: Info
         continue-on-error: true
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq rizin binutils file || sudo apt-get install -y -qq binutils file
           mkdir -p out/info
-          F="$TARGET"
-          file "$F" > out/info/file.txt
-          strings -n 8 "$F" | head -n 30000 > out/info/strings.txt
-          objdump -x "$F" > out/info/headers.txt 2>&1 || true
+          file "$TARGET" > out/info/file.txt
+          strings -n 8 "$TARGET" | head -n 30000 > out/info/strings.txt
+          objdump -x "$TARGET" > out/info/headers.txt 2>&1 || true
           if command -v rz-bin >/dev/null; then
-            rz-bin -I "$F" > out/info/rz-info.txt 2>&1 || true
-            rz-bin -i "$F" > out/info/imports.txt 2>&1 || true
-            rz-bin -l "$F" > out/info/libraries.txt 2>&1 || true
+            rz-bin -I "$TARGET" > out/info/rz-info.txt 2>&1 || true
+            rz-bin -i "$TARGET" > out/info/imports.txt 2>&1 || true
+            rz-bin -l "$TARGET" > out/info/libraries.txt 2>&1 || true
           fi
           grep -aiE "haxe|openfl|lime|heaps|flixel|unity|mono|il2cpp|godot|unreal|gamemaker|love2d|sdl|monogame|xna|electron|nw\.js|adobe air|flash|steam_api|cocos|defold|raylib" out/info/strings.txt out/info/imports.txt out/info/libraries.txt 2>/dev/null | head -n 300 > out/info/engine-hints.txt || true
-
-      - name: JADX
-        if: steps.pick.outputs.jadx == 'true'
-        continue-on-error: true
-        run: |
-          wget -q https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip
-          unzip -q jadx-1.5.6.zip -d jadx
-          mkdir -p out/jadx
-          export JADX_OPTS="-Xmx10g"
-          ./jadx/bin/jadx -d out/jadx "$TARGET" || true
-
-      - name: Apktool
-        if: steps.pick.outputs.apk == 'true'
-        continue-on-error: true
-        run: |
-          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O apktool.jar
-          java -jar apktool.jar d -f -o out/apktool "$TARGET"
-
-      - name: Ghidra
-        if: steps.pick.outputs.ghidra == 'true'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          URL=$(gh api repos/NationalSecurityAgency/ghidra/releases/latest --jq '.assets[] | select(.name|endswith(".zip")) | .browser_download_url' | head -1)
-          wget -q "$URL" -O ghidra.zip
-          unzip -q ghidra.zip -d ghidra
-          HEADLESS=$(find ghidra -name analyzeHeadless -type f | head -1)
-          mkdir -p out/ghidra gproj
-          "$HEADLESS" gproj p -import "$TARGET" \
-            -scriptPath ghidra_scripts \
-            -postScript DecompileAll.java "$PWD/out/ghidra/decompiled.c" \
-            -deleteProject
-
-      - name: Kuna
-        if: steps.pick.outputs.kuna == 'true'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api repos/Noelo-Lab/kuna/releases/latest > rel.json
-          echo "Kuna assets:"; jq -r '.assets[].name' rel.json
-          BIN_URL=$(jq -r '.assets[] | select(.name|test("linux";"i")) | select(.name|test("x86_64|amd64|x64";"i")) | select(.name|test("specs|ghidra";"i")|not) | .browser_download_url' rel.json | head -1)
-          SPECS_URL=$(jq -r '.assets[] | select(.name|test("specs";"i")) | select(.name|test("ghidra";"i")|not) | .browser_download_url' rel.json | head -1)
-          [ -n "$BIN_URL" ] || { echo "No Linux x86_64 Kuna asset found"; exit 1; }
-          mkdir -p kuna-bin kuna-specs
-          wget -q "$BIN_URL" -O kuna-bin/pkg
-          case "$BIN_URL" in
-            *.zip) unzip -q kuna-bin/pkg -d kuna-bin ;;
-            *) tar -xzf kuna-bin/pkg -C kuna-bin ;;
-          esac
-          KUNA=$(find kuna-bin -type f -name kuna | head -1)
-          chmod +x "$KUNA"
-          if [ -n "$SPECS_URL" ]; then
-            wget -q "$SPECS_URL" -O specs.tgz
-            tar -xzf specs.tgz -C kuna-specs
-            SP=$(find kuna-specs -type d -name specs | head -1)
-            export KUNA_SPECS="${SP:-$PWD/kuna-specs}"
-          fi
-          mkdir -p out/kuna
-          cp "$TARGET" out/kuna/
-          cd out/kuna
-          "$GITHUB_WORKSPACE/$KUNA" decompile-project "$(basename "$TARGET")" || true
-          rm -f "$(basename "$TARGET")"
-
       - name: Rizin (functions and disassembly)
-        if: steps.pick.outputs.rizin == 'true'
+        if: needs.plan.outputs.rizin == 'true'
         continue-on-error: true
         run: |
-          command -v rizin >/dev/null || sudo apt-get install -y -qq rizin
           mkdir -p out/rizin
           rizin -q -c 'aaa; afl' "$TARGET" > out/rizin/functions.txt 2>&1 || true
           rizin -q -c 'aaa; pdf @ entry0' "$TARGET" > out/rizin/entry.txt 2>&1 || true
           rizin -q -c 'izz' "$TARGET" | head -n 50000 > out/rizin/all-strings.txt 2>&1 || true
-
-      # Only produces output for .NET programs
-      - name: ILSpy (.NET)
-        if: steps.pick.outputs.ghidra == 'true'
+      - name: ILSpy (.NET only)
+        if: needs.plan.outputs.rizin == 'true'
         continue-on-error: true
         run: |
           if grep -qi "Mono/.Net\|PE32.*Mono" out/info/file.txt; then
@@ -164,9 +86,216 @@ jobs:
           else
             echo "Not a .NET file, skipping"
           fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: out-info
+          path: out/
+          if-no-files-found: ignore
 
+  jadx:
+    needs: plan
+    if: needs.plan.outputs.jadx == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_INPUT: ${{ inputs.target }}
+        run: bash scripts/fetch-target.sh
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/cache@v4
+        id: jc
+        with:
+          path: jadx
+          key: jadx-1.5.6
+      - name: Get JADX
+        if: steps.jc.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip
+          unzip -q jadx-1.5.6.zip -d jadx
+      - name: Run JADX
+        continue-on-error: true
+        run: |
+          mkdir -p out/jadx
+          export JADX_OPTS="-Xmx10g"
+          ./jadx/bin/jadx -d out/jadx "$TARGET" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: out-jadx
+          path: out/
+          if-no-files-found: ignore
+
+  apktool:
+    needs: plan
+    if: needs.plan.outputs.apk == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_INPUT: ${{ inputs.target }}
+        run: bash scripts/fetch-target.sh
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Run Apktool
+        continue-on-error: true
+        run: |
+          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O apktool.jar
+          java -jar apktool.jar d -f -o out/apktool "$TARGET"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: out-apktool
+          path: out/
+          if-no-files-found: ignore
+
+  ghidra:
+    needs: plan
+    if: needs.plan.outputs.ghidra == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_INPUT: ${{ inputs.target }}
+        run: bash scripts/fetch-target.sh
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Find latest Ghidra
+        id: gh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/NationalSecurityAgency/ghidra/releases/latest > rel.json
+          echo "tag=$(jq -r .tag_name rel.json)" >> "$GITHUB_OUTPUT"
+          echo "url=$(jq -r '.assets[] | select(.name|endswith(".zip")) | .browser_download_url' rel.json | head -1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: gc
+        with:
+          path: ghidra
+          key: ghidra-${{ steps.gh.outputs.tag }}
+      - name: Get Ghidra
+        if: steps.gc.outputs.cache-hit != 'true'
+        run: |
+          wget -q "${{ steps.gh.outputs.url }}" -O ghidra.zip
+          unzip -q ghidra.zip -d ghidra
+      - name: Run Ghidra
+        continue-on-error: true
+        run: |
+          HEADLESS=$(find ghidra -name analyzeHeadless -type f | head -1)
+          mkdir -p out/ghidra gproj
+          "$HEADLESS" gproj p -import "$TARGET" \
+            -scriptPath ghidra_scripts \
+            -postScript DecompileAll.java "$PWD/out/ghidra/decompiled.c" \
+            -deleteProject
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: out-ghidra
+          path: out/
+          if-no-files-found: ignore
+
+  kuna:
+    needs: plan
+    if: needs.plan.outputs.kuna == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_INPUT: ${{ inputs.target }}
+        run: bash scripts/fetch-target.sh
+      - name: Find latest Kuna
+        id: kv
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/Noelo-Lab/kuna/releases/latest > rel.json
+          echo "Kuna assets:"; jq -r '.assets[].name' rel.json
+          echo "tag=$(jq -r .tag_name rel.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: kc
+        with:
+          path: |
+            kuna-bin
+            kuna-specs
+          key: kuna-${{ steps.kv.outputs.tag }}
+      - name: Get Kuna
+        if: steps.kc.outputs.cache-hit != 'true'
+        run: |
+          BIN_URL=$(jq -r '.assets[] | select(.name|test("linux";"i")) | select(.name|test("x86_64|amd64|x64";"i")) | select(.name|test("specs|ghidra";"i")|not) | .browser_download_url' rel.json | head -1)
+          SPECS_URL=$(jq -r '.assets[] | select(.name|test("specs";"i")) | select(.name|test("ghidra";"i")|not) | .browser_download_url' rel.json | head -1)
+          [ -n "$BIN_URL" ] || { echo "No Linux x86_64 Kuna asset found"; exit 1; }
+          mkdir -p kuna-bin kuna-specs
+          wget -q "$BIN_URL" -O kuna-bin/pkg
+          case "$BIN_URL" in
+            *.zip) unzip -q kuna-bin/pkg -d kuna-bin ;;
+            *) tar -xzf kuna-bin/pkg -C kuna-bin ;;
+          esac
+          chmod +x "$(find kuna-bin -type f -name kuna | head -1)"
+          if [ -n "$SPECS_URL" ]; then
+            wget -q "$SPECS_URL" -O specs.tgz
+            tar -xzf specs.tgz -C kuna-specs
+          fi
+      - name: Run Kuna
+        continue-on-error: true
+        run: |
+          KUNA=$(find kuna-bin -type f -name kuna | head -1)
+          SP=$(find kuna-specs -type d -name specs 2>/dev/null | head -1)
+          [ -n "$SP" ] && export KUNA_SPECS="$PWD/$SP"
+          mkdir -p out/kuna
+          cp "$TARGET" out/kuna/
+          cd out/kuna
+          "$GITHUB_WORKSPACE/$KUNA" decompile-project "$(basename "$TARGET")" || true
+          rm -f "$(basename "$TARGET")"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: out-kuna
+          path: out/
+          if-no-files-found: ignore
+
+  summary:
+    needs: [plan, info, jadx, apktool, ghidra, kuna]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect outputs
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: out-*
+          merge-multiple: true
+          path: out
+      - name: Build summary
+        env:
+          TARGET_INPUT: ${{ inputs.target }}
+          R_INFO: ${{ needs.info.result }}
+          R_JADX: ${{ needs.jadx.result }}
+          R_APKTOOL: ${{ needs.apktool.result }}
+          R_GHIDRA: ${{ needs.ghidra.result }}
+          R_KUNA: ${{ needs.kuna.result }}
+        run: bash scripts/summarize.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: result
+          name: summary
+          path: out/summary.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: full
           path: out/
-          if-no-files-found: warn
+          retention-days: 7

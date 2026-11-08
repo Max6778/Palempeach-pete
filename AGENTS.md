@@ -1,15 +1,17 @@
 # Decompile hub
 
-To analyze any file (APK, DEX, JAR, .so, ELF, .exe, .dll), run:
+To analyze a file (APK, DEX, JAR, .so, ELF, .exe, .dll):
 
-    ./decompile.sh /full/path/to/file
+    ./decompile.sh /full/path/to/file [auto|jadx|ghidra|kuna|rizin|all] [--full]
 
-It uploads the file to GitHub Actions and downloads the result into
-./out/<filename>/. Read the files in that folder.
-
-Tools: JADX and Apktool (Android), Ghidra, Kuna, Rizin, ILSpy (.NET), plus an
-info step that always runs (file type, strings, headers, engine hints).
-Add `jadx`, `ghidra`, `kuna`, `rizin` or `all` as a second argument to force
-tools. Hopper and IDA are not available here (paid, no headless mode).
-
-Start with out/<filename>/info/engine-hints.txt to see which engine a program uses.
+RULES (saves tokens):
+1. This only STARTS the job in the background. After it prints STARTED, STOP.
+   Reply with one short sentence ("Started. Tell me when it is finished.").
+   Do NOT poll, sleep, watch, or check status.
+2. When the user says it is done, run: ./decompile.sh result
+3. Read the short summary. Never cat big files; use `grep -rn pattern <dir> | head -40`.
+   Only use `result --full` when you need the actual code.
+4. Upload, big files, workflow, cached tools and download are all automatic.
+   If gh is not logged in, ask the USER to run `gh auth login` themselves.
+5. Default is fast (no Ghidra). Use `ghidra` or `all` only when needed.
+6. Hopper and IDA are not available.
