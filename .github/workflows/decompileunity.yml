@@ -1,0 +1,47 @@
+name: Decompile Unity game
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_url:
+        description: "Direct link to the game .zip (e.g. a GitHub Release asset)"
+        required: true
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and unzip game
+        run: |
+          mkdir game
+          curl -L "${{ github.event.inputs.game_url }}" -o game.zip
+          unzip -q game.zip -d game
+
+      - name: Find Assembly-CSharp.dll
+        run: |
+          DLL=$(find game -name "Assembly-CSharp.dll" | head -n 1)
+          echo "Found: $DLL"
+          echo "DLL=$DLL" >> $GITHUB_ENV
+
+      - name: Find Unity version
+        run: |
+          GGM=$(find game -name "globalgamemanagers" | head -n 1)
+          echo "Unity version:"
+          strings "$GGM" | grep -m1 -E '^[0-9]{4}\.[0-9]+\.[0-9]+[fpb][0-9]+' | tee unity_version.txt
+
+      - name: Install ILSpy command line
+        run: |
+          dotnet tool install -g ilspycmd
+          echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+
+      - name: Decompile
+        run: |
+          mkdir -p out/Scripts
+          ilspycmd -p -o out/Scripts "$DLL"
+          cp unity_version.txt out/
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: decompiled
+          path: out
