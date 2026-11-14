@@ -16,7 +16,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir game
-          gh release download game1 -p "Game.zip" -O game.zip
+                    gh release download game1 --repo ${{ github.repository }} -p "Game.zip" -O game.zip
           unzip -q game.zip -d game
 
       - name: Find Assembly-CSharp.dll
