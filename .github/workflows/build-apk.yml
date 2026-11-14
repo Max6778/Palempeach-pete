@@ -1,0 +1,177 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      script_mode:
+        description: "How AssetRipper exports the game code"
+        type: choice
+        default: DllExportWithoutRenaming
+        options:
+          - DllExportWithoutRenaming
+          - Decompiled
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/swift /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Download and unzip game
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir game
+          gh release download game1 --repo ${{ github.repository }} -p "Game.zip" -O game.zip
+          unzip -q game.zip -d game
+          test -n "$(find game -name globalgamemanagers | head -n 1)" || { echo "ERROR: game files not found"; exit 1; }
+
+      - name: Download AssetRipper
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir ar_dl ar
+          gh release download --repo AssetRipper/AssetRipper -p "*linux_x64*" -D ar_dl
+          for f in ar_dl/*; do
+            case "$f" in
+              *.zip) unzip -q "$f" -d ar ;;
+              *.tar.gz|*.tgz) tar -xzf "$f" -C ar ;;
+              *.tar.xz) tar -xJf "$f" -C ar ;;
+              *.tar) tar -xf "$f" -C ar ;;
+            esac
+          done
+          EXE=$(find ar -name "AssetRipper.GUI.Free" -type f | head -n 1)
+          test -n "$EXE" || { echo "ERROR: AssetRipper not found"; ls -R ar_dl; exit 1; }
+          chmod +x "$EXE"
+          echo "EXE=$PWD/$EXE" >> $GITHUB_ENV
+
+      - name: Export Unity project with AssetRipper
+        run: |
+          DATA=$(dirname "$(find game -name globalgamemanagers | head -n 1)")
+          GAMEDIR="$PWD/$(dirname "$DATA")"
+          "$EXE" --headless --port 5000 --log-path "$PWD/ar.log" > ar_stdout.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -s http://127.0.0.1:5000 > /dev/null && break
+            sleep 2
+          done
+          echo "Set script mode: ${{ inputs.script_mode }}"
+          curl -s -o /dev/null -w "settings http %{http_code}\n" -X POST \
+            --data-urlencode "ScriptExportMode=${{ inputs.script_mode }}" \
+            http://127.0.0.1:5000/Settings/Update
+          curl -s -o /dev/null -w "load http %{http_code}\n" --max-time 600 -X POST \
+            --data-urlencode "Path=$GAMEDIR" http://127.0.0.1:5000/LoadFolder
+          curl -s -o /dev/null -w "export http %{http_code}\n" --max-time 1800 -X POST \
+            --data-urlencode "Path=$PWD/export" http://127.0.0.1:5000/Export/UnityProject
+          sleep 5
+          pkill -f AssetRipper || true
+          grep -m1 "ScriptExportMode" ar.log || true
+          test -d export/ExportedProject/Assets || { echo "ERROR: export failed"; tail -n 40 ar.log; exit 1; }
+          test -d export/ExportedProject/ProjectSettings || { echo "ERROR: no ProjectSettings"; exit 1; }
+          du -sh export
+
+      - name: Install Unity 2020.3.49f1 with Android
+        uses: RageAgainstThePixel/unity-setup@v2
+        with:
+          version-file: None
+          unity-version: 2020.3.49f1
+          build-targets: Android
+          hub-version: '3.14.3'
+
+      - name: Activate Personal license
+        uses: RageAgainstThePixel/activate-unity-license@v2
+        with:
+          license: Personal
+          username: ${{ secrets.UNITY_EMAIL }}
+          password: ${{ secrets.UNITY_PASSWORD }}
+
+      - name: Add build script
+        run: |
+          mkdir -p export/ExportedProject/Assets/Editor
+          cat > export/ExportedProject/Assets/Editor/CIBuild.cs << 'EOF'
+          using System;
+          using System.Collections.Generic;
+          using System.IO;
+          using UnityEditor;
+          using UnityEditor.Build.Reporting;
+
+          public static class CIBuild
+          {
+              public static void BuildAndroid()
+              {
+                  var scenes = new List<string>();
+                  foreach (var s in EditorBuildSettings.scenes)
+                      if (s.enabled) scenes.Add(s.path);
+                  Console.WriteLine("CIBuild: scenes in build = " + scenes.Count);
+                  if (scenes.Count == 0)
+                  {
+                      Console.WriteLine("CIBuild: no scenes found, aborting");
+                      EditorApplication.Exit(2);
+                      return;
+                  }
+
+                  PlayerSettings.SetApplicationIdentifier(BuildTargetGroup.Android, "com.epic.gameport");
+                  PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, ScriptingImplementation.Mono2x);
+                  PlayerSettings.Android.targetArchitectures = AndroidArchitecture.ARMv7;
+                  PlayerSettings.Android.minSdkVersion = AndroidSdkVersions.AndroidApiLevel22;
+                  EditorUserBuildSettings.buildAppBundle = false;
+
+                  string outPath = Environment.GetEnvironmentVariable("APK_OUT");
+                  if (string.IsNullOrEmpty(outPath)) outPath = Path.GetFullPath("game.apk");
+                  Directory.CreateDirectory(Path.GetDirectoryName(outPath));
+
+                  var options = new BuildPlayerOptions
+                  {
+                      scenes = scenes.ToArray(),
+                      locationPathName = outPath,
+                      target = BuildTarget.Android,
+                      options = BuildOptions.None
+                  };
+                  var report = BuildPipeline.BuildPlayer(options);
+                  Console.WriteLine("CIBuild: result = " + report.summary.result);
+                  if (report.summary.result != BuildResult.Succeeded)
+                      EditorApplication.Exit(1);
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: |
+          EDITOR="$UNITY_EDITOR_PATH"
+          if [ -d "$EDITOR" ]; then
+            EDITOR=$(find "$EDITOR" -maxdepth 3 -type f -name Unity | head -n 1)
+          fi
+          echo "Using editor: $EDITOR"
+          test -x "$EDITOR" || { echo "ERROR: Unity editor not found"; exit 1; }
+          export APK_OUT="$PWD/apk/game.apk"
+          "$EDITOR" -batchmode -nographics -quit \
+            -projectPath "$PWD/export/ExportedProject" \
+            -buildTarget Android \
+            -executeMethod CIBuild.BuildAndroid \
+            -logFile "$PWD/unity.log"
+          test -f "$APK_OUT" || { echo "ERROR: APK was not created"; exit 1; }
+          ls -lh "$APK_OUT"
+
+      - name: Show Unity errors
+        if: always()
+        run: |
+          grep -E "error CS|CIBuild:|Build Finished|Error building|BuildFailed|Gradle build failed" unity.log | sort -u | head -n 60 || true
+          tail -n 30 unity.log || true
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: game-apk
+          path: apk/game.apk
+          if-no-files-found: error
+
+      - name: Upload Unity log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unity-log
+          path: unity.log
+          if-no-files-found: ignore
