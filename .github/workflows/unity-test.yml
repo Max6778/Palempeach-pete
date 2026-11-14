@@ -13,6 +13,7 @@ jobs:
           version-file: None
           unity-version: 2020.3.49f1
           build-targets: Android
+          hub-version: '3.14.3'
 
       - name: Activate Personal license
         uses: RageAgainstThePixel/activate-unity-license@v2
