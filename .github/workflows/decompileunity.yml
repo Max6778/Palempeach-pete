@@ -12,9 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download and unzip game
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir game
-          curl -L "${{ github.event.inputs.game_url }}" -o game.zip
+          gh release download game1 -p "Game.zip" -O game.zip
           unzip -q game.zip -d game
 
       - name: Find Assembly-CSharp.dll
