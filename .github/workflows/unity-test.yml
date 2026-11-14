@@ -1,0 +1,27 @@
+name: Test Unity activation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Unity 2020.3.49f1 with Android
+        uses: RageAgainstThePixel/unity-setup@v2
+        with:
+          version-file: None
+          unity-version: 2020.3.49f1
+          build-targets: Android
+
+      - name: Activate Personal license
+        uses: RageAgainstThePixel/activate-unity-license@v2
+        with:
+          license: Personal
+          username: ${{ secrets.UNITY_EMAIL }}
+          password: ${{ secrets.UNITY_PASSWORD }}
+
+      - name: Show editor path
+        run: |
+          echo "Editor: $UNITY_EDITOR_PATH"
+          ls "$UNITY_EDITOR_PATH" || true
