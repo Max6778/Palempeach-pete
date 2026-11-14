@@ -6,10 +6,11 @@ on:
       script_mode:
         description: "How AssetRipper exports the game code"
         type: choice
-        default: DllExportWithoutRenaming
+        default: Hybrid
         options:
-          - DllExportWithoutRenaming
+          - Hybrid
           - Decompiled
+          - DllExportWithoutRenaming
 
 jobs:
   build:
@@ -80,6 +81,7 @@ jobs:
           unity-version: 2020.3.49f1
           build-targets: Android
           hub-version: '3.14.3'
+          cache-installation: true
 
       - name: Activate Personal license
         uses: RageAgainstThePixel/activate-unity-license@v2
