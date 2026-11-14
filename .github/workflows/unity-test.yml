@@ -5,7 +5,7 @@ on:
 
 jobs:
   test:
-        runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Install Unity 2020.3.49f1 with Android
         uses: RageAgainstThePixel/unity-setup@v2
