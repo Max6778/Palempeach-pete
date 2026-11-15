@@ -1,0 +1,69 @@
+name: Get game scripts
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scripts:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download and unzip game
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir game
+          gh release download game1 --repo ${{ github.repository }} -p "Game.zip" -O game.zip
+          unzip -q game.zip -d game
+
+      - name: Download AssetRipper
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir ar_dl ar
+          gh release download --repo AssetRipper/AssetRipper -p "*linux_x64*" -D ar_dl
+          for f in ar_dl/*; do
+            case "$f" in
+              *.zip) unzip -q "$f" -d ar ;;
+              *.tar.gz|*.tgz) tar -xzf "$f" -C ar ;;
+              *.tar.xz) tar -xJf "$f" -C ar ;;
+              *.tar) tar -xf "$f" -C ar ;;
+            esac
+          done
+          EXE=$(find ar -name "AssetRipper.GUI.Free" -type f | head -n 1)
+          chmod +x "$EXE"
+          echo "EXE=$PWD/$EXE" >> $GITHUB_ENV
+
+      - name: Export with AssetRipper (Hybrid)
+        run: |
+          DATA=$(dirname "$(find game -name globalgamemanagers | head -n 1)")
+          GAMEDIR="$PWD/$(dirname "$DATA")"
+          "$EXE" --headless --port 5000 --log-path "$PWD/ar.log" > ar_stdout.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -s http://127.0.0.1:5000 > /dev/null && break
+            sleep 2
+          done
+          curl -s -o /dev/null -w "settings http %{http_code}\n" -X POST \
+            --data-urlencode "ScriptExportMode=Hybrid" http://127.0.0.1:5000/Settings/Update
+          curl -s -o /dev/null -w "load http %{http_code}\n" --max-time 600 -X POST \
+            --data-urlencode "Path=$GAMEDIR" http://127.0.0.1:5000/LoadFolder
+          curl -s -o /dev/null -w "export http %{http_code}\n" --max-time 1800 -X POST \
+            --data-urlencode "Path=$PWD/export" http://127.0.0.1:5000/Export/UnityProject
+          sleep 5
+          pkill -f AssetRipper || true
+          grep -m1 "ScriptExportMode" ar.log || true
+
+      - name: Zip the game scripts
+        run: |
+          SRC=$(find export/ExportedProject/Assets -type d -name "Assembly-CSharp" | head -n 1)
+          echo "Scripts folder: $SRC"
+          test -n "$SRC" || { echo "ERROR: scripts folder not found"; ls export/ExportedProject/Assets/Scripts; exit 1; }
+          mkdir out
+          cd "$SRC" && zip -q -r "$GITHUB_WORKSPACE/out/game-scripts.zip" . && cd "$GITHUB_WORKSPACE"
+          ls -lh out/game-scripts.zip
+          find "$SRC" -name "*.cs" | wc -l
+
+      - name: Upload scripts
+        uses: actions/upload-artifact@v4
+        with:
+          name: game-scripts
+          path: out/game-scripts.zip
