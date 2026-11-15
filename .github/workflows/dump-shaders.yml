@@ -1,0 +1,132 @@
+name: Dump shader info
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dump:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download and unzip game
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir game
+          gh release download game1 --repo ${{ github.repository }} -p "Game.zip" -O game.zip
+          unzip -q game.zip -d game
+
+      - name: Download AssetRipper
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir ar_dl ar
+          gh release download --repo AssetRipper/AssetRipper -p "*linux_x64*" -D ar_dl
+          for f in ar_dl/*; do
+            case "$f" in
+              *.zip) unzip -q "$f" -d ar ;;
+              *.tar.gz|*.tgz) tar -xzf "$f" -C ar ;;
+              *.tar.xz) tar -xJf "$f" -C ar ;;
+              *.tar) tar -xf "$f" -C ar ;;
+            esac
+          done
+          EXE=$(find ar -name "AssetRipper.GUI.Free" -type f | head -n 1)
+          chmod +x "$EXE"
+          echo "EXE=$PWD/$EXE" >> $GITHUB_ENV
+
+      - name: Export with AssetRipper
+        run: |
+          DATA=$(dirname "$(find game -name globalgamemanagers | head -n 1)")
+          GAMEDIR="$PWD/$(dirname "$DATA")"
+          "$EXE" --headless --port 5000 --log-path "$PWD/ar.log" > ar_stdout.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -s http://127.0.0.1:5000 > /dev/null && break
+            sleep 2
+          done
+          curl -s -o /dev/null -w "settings http %{http_code}\n" -X POST \
+            --data-urlencode "ScriptExportMode=Hybrid" \
+            --data-urlencode "ShaderExportMode=Decompile" \
+            http://127.0.0.1:5000/Settings/Update
+          curl -s -o /dev/null -w "load http %{http_code}\n" --max-time 600 -X POST \
+            --data-urlencode "Path=$GAMEDIR" http://127.0.0.1:5000/LoadFolder
+          curl -s -o /dev/null -w "export http %{http_code}\n" --max-time 1800 -X POST \
+            --data-urlencode "Path=$PWD/export" http://127.0.0.1:5000/Export/UnityProject
+          sleep 5
+          pkill -f AssetRipper || true
+          grep -m1 "ShaderExportMode" ar.log || true
+          echo "shader files: $(find export/ExportedProject/Assets -name '*.shader' | wc -l), under 2 KB: $(find export/ExportedProject/Assets -name '*.shader' -size -2k | wc -l)"
+
+      - name: Build the shader report
+        run: |
+          mkdir out
+          cat > report.py << 'EOF'
+          import os, re
+
+          root = "export/ExportedProject/Assets"
+          shaders = []
+          mats = {}
+          for dp, dn, fn in os.walk(root):
+              for f in fn:
+                  p = os.path.join(dp, f)
+                  if f.endswith(".shader"):
+                      shaders.append(p)
+                  elif f.endswith(".mat"):
+                      mats[p] = open(p, errors="ignore").read()
+
+          def guid_of(path):
+              try:
+                  m = open(path + ".meta", errors="ignore").read()
+              except OSError:
+                  return ""
+              g = re.search(r"guid:\s*([0-9a-f]{32})", m)
+              return g.group(1) if g else ""
+
+          def props_of(text):
+              res = {"tex": [], "float": [], "color": []}
+              cur = None
+              for line in text.split("\n"):
+                  s = line.strip()
+                  if s.startswith("m_TexEnvs:"):
+                      cur = "tex"
+                      continue
+                  if s.startswith("m_Floats:"):
+                      cur = "float"
+                      continue
+                  if s.startswith("m_Colors:"):
+                      cur = "color"
+                      continue
+                  mm = re.match(r"- (\w+):(.*)", s)
+                  if cur and mm and line.startswith("    - "):
+                      res[cur].append((mm.group(1), mm.group(2).strip()))
+              return res
+
+          out = []
+          out.append("Shaders: %d, materials: %d" % (len(shaders), len(mats)))
+          for sp in sorted(shaders):
+              guid = guid_of(sp)
+              using = [m for m, t in mats.items() if guid and guid in t]
+              out.append("=" * 70)
+              out.append("%s | %d bytes | materials using it: %d" % (sp.replace(root + "/", ""), os.path.getsize(sp), len(using)))
+              lines = open(sp, errors="ignore").read().split("\n")
+              out.extend(lines[:60])
+              if len(lines) > 60:
+                  out.append("... (%d more lines)" % (len(lines) - 60))
+              if using:
+                  out.append("-- material properties (from %s) --" % os.path.basename(using[0]))
+                  pr = props_of(mats[using[0]])
+                  out.append("textures: " + ", ".join(n for n, v in pr["tex"]))
+                  out.append("floats: " + ", ".join("%s=%s" % (n, v) for n, v in pr["float"][:40]))
+                  out.append("colors: " + ", ".join("%s=%s" % (n, v) for n, v in pr["color"][:20]))
+          open("out/shaders.txt", "w").write("\n".join(out))
+          print("report lines:", len(out))
+          EOF
+          python3 report.py
+          ls -l out/shaders.txt
+
+      - name: Publish report to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete shaders --repo ${{ github.repository }} --yes --cleanup-tag || true
+          gh release create shaders out/shaders.txt --repo ${{ github.repository }} --title "Shader report" --notes "Shader names and properties"
