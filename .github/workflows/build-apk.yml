@@ -16,6 +16,8 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    permissions:
+      contents: write
     steps:
       - name: Free disk space
         run: |
@@ -89,6 +91,453 @@ jobs:
           license: Personal
           username: ${{ secrets.UNITY_EMAIL }}
           password: ${{ secrets.UNITY_PASSWORD }}
+
+      - name: Patch game scripts for Android
+        run: |
+          SCRIPTS=$(find export/ExportedProject/Assets -type d -name "Assembly-CSharp" | head -n 1)
+          echo "Scripts folder: $SCRIPTS"
+          test -f "$SCRIPTS/InputManager.cs" || { echo "ERROR: InputManager.cs not found"; exit 1; }
+          cat > "$SCRIPTS/InputManager.cs" << 'EOF'
+          using System.Collections.Generic;
+          using Steamworks;
+          using UnityEngine;
+
+          // Touch version of the game's input manager (replaces the Rewired + Steam Input version).
+          public class InputManager : Singleton<InputManager>
+          {
+          	// ---- Tuning: change these numbers to adjust how the touch controls feel ----
+          	private const float LookScale = 0.12f;
+          	private const float CursorScale = 0.35f;
+          	private const float TapMaxSeconds = 0.3f;
+          	private const float TapMaxMove = 30f;
+
+          	private struct TouchButton
+          	{
+          		public string id;
+          		public string label;
+          		public Vector2 center;
+          		public float radius;
+          	}
+
+          	private HashSet<string> held = new HashSet<string>();
+
+          	private HashSet<string> down = new HashSet<string>();
+
+          	private Dictionary<int, string> fingerButtons = new Dictionary<int, string>();
+
+          	private List<TouchButton> buttons = new List<TouchButton>();
+
+          	private string currentActionSetId = "Interface";
+
+          	private bool inputFrozen;
+
+          	private bool frameStopped;
+
+          	private bool anyTouchDown;
+
+          	private bool tapReleasePending;
+
+          	private int joyFinger = -1;
+
+          	private Vector2 joyOrigin;
+
+          	private Vector2 joyVector;
+
+          	private int lookFinger = -1;
+
+          	private Vector2 lookStart;
+
+          	private float lookStartTime;
+
+          	private Vector2 dragDelta;
+
+          	private Texture2D circleTex;
+
+          	private GUIStyle labelStyle;
+
+          	public InputHandle_t LastUsedInputHandle => default(InputHandle_t);
+
+          	public bool SteamInputActive => false;
+
+          	public bool RewiredControllerAvailable => false;
+
+          	protected override void AwakeFunction()
+          	{
+          		base.AwakeFunction();
+          		Debug.Log("Initializing touch input management.");
+          		Input.simulateMouseWithTouches = false;
+          		Input.multiTouchEnabled = true;
+          		circleTex = MakeCircle(64);
+          	}
+
+          	private static Texture2D MakeCircle(int size)
+          	{
+          		Texture2D texture2D = new Texture2D(size, size, TextureFormat.RGBA32, false);
+          		float num = (float)size / 2f;
+          		for (int i = 0; i < size; i++)
+          		{
+          			for (int j = 0; j < size; j++)
+          			{
+          				float num2 = (float)j + 0.5f - num;
+          				float num3 = (float)i + 0.5f - num;
+          				float num4 = Mathf.Sqrt(num2 * num2 + num3 * num3);
+          				float a = Mathf.Clamp01(num - num4);
+          				texture2D.SetPixel(j, i, new Color(1f, 1f, 1f, a));
+          			}
+          		}
+          		texture2D.Apply();
+          		return texture2D;
+          	}
+
+          	public void CheckMouseMap()
+          	{
+          	}
+
+          	private void AddButton(string id, string label, Vector2 center, float radius)
+          	{
+          		TouchButton item = default(TouchButton);
+          		item.id = id;
+          		item.label = label;
+          		item.center = center;
+          		item.radius = radius;
+          		buttons.Add(item);
+          	}
+
+          	private void BuildButtons()
+          	{
+          		buttons.Clear();
+          		float num = (float)Screen.height / 720f;
+          		float num2 = Screen.width;
+          		float num3 = Screen.height;
+          		if (currentActionSetId == "Interface")
+          		{
+          			AddButton("MouseSubmit", "CLICK", new Vector2(num2 - 130f * num, 140f * num), 75f * num);
+          			AddButton("Pause", "BACK", new Vector2(70f * num, num3 - 70f * num), 45f * num);
+          			return;
+          		}
+          		AddButton("Interact", "USE", new Vector2(num2 - 130f * num, 170f * num), 75f * num);
+          		AddButton("UseItem", "ITEM", new Vector2(num2 - 290f * num, 110f * num), 55f * num);
+          		AddButton("Run", "RUN", new Vector2(num2 - 110f * num, 340f * num), 55f * num);
+          		AddButton("LookBack", "BACK", new Vector2(num2 - 280f * num, 270f * num), 45f * num);
+          		AddButton("ItemLeft", "<", new Vector2(num2 * 0.5f - 90f * num, 60f * num), 42f * num);
+          		AddButton("ItemRight", ">", new Vector2(num2 * 0.5f + 90f * num, 60f * num), 42f * num);
+          		AddButton("Map", "MAP", new Vector2(num2 - 170f * num, num3 - 60f * num), 38f * num);
+          		AddButton("Pause", "II", new Vector2(num2 - 60f * num, num3 - 60f * num), 38f * num);
+          	}
+
+          	private string HitButton(Vector2 position)
+          	{
+          		for (int i = 0; i < buttons.Count; i++)
+          		{
+          			if ((position - buttons[i].center).magnitude <= buttons[i].radius * 1.25f)
+          			{
+          				return buttons[i].id;
+          			}
+          		}
+          		return null;
+          	}
+
+          	private void Update()
+          	{
+          		if (tapReleasePending)
+          		{
+          			if (!fingerButtons.ContainsValue("MouseSubmit"))
+          			{
+          				held.Remove("MouseSubmit");
+          			}
+          			tapReleasePending = false;
+          		}
+          		dragDelta = Vector2.zero;
+          		BuildButtons();
+          		float num = (float)Screen.height / 720f;
+          		bool flag = currentActionSetId == "Interface";
+          		for (int i = 0; i < Input.touchCount; i++)
+          		{
+          			Touch touch = Input.GetTouch(i);
+          			int fingerId = touch.fingerId;
+          			if (touch.phase == TouchPhase.Began)
+          			{
+          				anyTouchDown = true;
+          				string text = HitButton(touch.position);
+          				if (text != null)
+          				{
+          					fingerButtons[fingerId] = text;
+          					held.Add(text);
+          					down.Add(text);
+          				}
+          				else if (!flag && joyFinger < 0 && touch.position.x < (float)Screen.width * 0.4f)
+          				{
+          					joyFinger = fingerId;
+          					joyOrigin = touch.position;
+          					joyVector = Vector2.zero;
+          				}
+          				else if (lookFinger < 0)
+          				{
+          					lookFinger = fingerId;
+          					lookStart = touch.position;
+          					lookStartTime = Time.unscaledTime;
+          				}
+          			}
+          			else if (touch.phase == TouchPhase.Moved || touch.phase == TouchPhase.Stationary)
+          			{
+          				if (fingerId == joyFinger)
+          				{
+          					joyVector = Vector2.ClampMagnitude((touch.position - joyOrigin) / (90f * num), 1f);
+          				}
+          				else if (fingerId == lookFinger)
+          				{
+          					dragDelta += touch.deltaPosition;
+          				}
+          			}
+          			else if (touch.phase == TouchPhase.Ended || touch.phase == TouchPhase.Canceled)
+          			{
+          				string value;
+          				if (fingerButtons.TryGetValue(fingerId, out value))
+          				{
+          					held.Remove(value);
+          					fingerButtons.Remove(fingerId);
+          				}
+          				if (fingerId == joyFinger)
+          				{
+          					joyFinger = -1;
+          					joyVector = Vector2.zero;
+          				}
+          				if (fingerId == lookFinger)
+          				{
+          					bool flag2 = Time.unscaledTime - lookStartTime < 0.3f;
+          					bool flag3 = (touch.position - lookStart).magnitude < 30f * num;
+          					if (touch.phase == TouchPhase.Ended && flag2 && flag3)
+          					{
+          						held.Add("MouseSubmit");
+          						down.Add("MouseSubmit");
+          						tapReleasePending = true;
+          					}
+          					lookFinger = -1;
+          				}
+          			}
+          		}
+          		if (Input.touchCount == 0)
+          		{
+          			fingerButtons.Clear();
+          			joyFinger = -1;
+          			joyVector = Vector2.zero;
+          			lookFinger = -1;
+          			List<string> list = new List<string>(held);
+          			for (int j = 0; j < list.Count; j++)
+          			{
+          				if (list[j] != "MouseSubmit" || !tapReleasePending)
+          				{
+          					held.Remove(list[j]);
+          				}
+          			}
+          		}
+          		if (Input.GetKeyDown(KeyCode.Escape))
+          		{
+          			down.Add("Pause");
+          		}
+          	}
+
+          	private void LateUpdate()
+          	{
+          		down.Clear();
+          		frameStopped = false;
+          		anyTouchDown = false;
+          	}
+
+          	public bool GetDigitalInput(string id, bool onDown)
+          	{
+          		if (inputFrozen || frameStopped)
+          		{
+          			return false;
+          		}
+          		if (onDown)
+          		{
+          			return down.Contains(id);
+          		}
+          		return held.Contains(id) || down.Contains(id);
+          	}
+
+          	public bool AnyButton(bool onDown)
+          	{
+          		if (inputFrozen || frameStopped)
+          		{
+          			return false;
+          		}
+          		if (onDown)
+          		{
+          			return anyTouchDown || down.Count > 0;
+          		}
+          		return held.Count > 0 || Input.touchCount > 0;
+          	}
+
+          	public void GetAnalogInput(AnalogInputData inputData, out Vector2 analog, out Vector2 delta)
+          	{
+          		GetAnalogInput(inputData, out analog, out delta, 1f);
+          	}
+
+          	public void GetAnalogInput(AnalogInputData inputData, out Vector2 analog, out Vector2 delta, float steamDeltaAdjustment)
+          	{
+          		analog = Vector2.zero;
+          		delta = Vector2.zero;
+          		if (inputFrozen || frameStopped || inputData == null)
+          		{
+          			return;
+          		}
+          		if (!string.IsNullOrEmpty(inputData.xAnalogId) && inputData.xAnalogId.StartsWith("Movement"))
+          		{
+          			analog = joyVector;
+          		}
+          		if (!string.IsNullOrEmpty(inputData.xDeltaId))
+          		{
+          			if (inputData.xDeltaId.StartsWith("Cursor"))
+          			{
+          				delta = dragDelta * 0.35f;
+          			}
+          			else if (inputData.xDeltaId.StartsWith("Camera") || inputData.xDeltaId.StartsWith("Map"))
+          			{
+          				delta = dragDelta * 0.12f;
+          			}
+          		}
+          	}
+
+          	public string GetInputButtonName(string id, string actionSet, bool showAll)
+          	{
+          		return GetInputButtonName(actionSet, showAll, id);
+          	}
+
+          	public string GetInputButtonName(string actionSet, bool showAll, params string[] ids)
+          	{
+          		if (ids == null || ids.Length == 0)
+          		{
+          			return "";
+          		}
+          		if (ids[0] == "MouseSubmit")
+          		{
+          			return "TAP";
+          		}
+          		string text = ids[0];
+          		if (showAll)
+          		{
+          			for (int i = 1; i < ids.Length; i++)
+          			{
+          				text = text + ", " + ids[i];
+          			}
+          		}
+          		return text;
+          	}
+
+          	public void ActivateActionSet(string id)
+          	{
+          		currentActionSetId = id;
+          	}
+
+          	public void FreezeInput(bool freeze)
+          	{
+          		inputFrozen = freeze;
+          	}
+
+          	public void StopFrame()
+          	{
+          		frameStopped = true;
+          	}
+
+          	public void Rumble(float speed, float duration, float leftStrength, float rightStrength)
+          	{
+          	}
+
+          	public void Rumble(float speed, float duration)
+          	{
+          	}
+
+          	public void Rumble(float speed, float duration, float signedAngle)
+          	{
+          	}
+
+          	public void SetColor(Color color)
+          	{
+          	}
+
+          	public void ResetControlMaps()
+          	{
+          	}
+
+          	private void OnGUI()
+          	{
+          		if (Event.current.type != EventType.Repaint || circleTex == null)
+          		{
+          			return;
+          		}
+          		if (labelStyle == null)
+          		{
+          			labelStyle = new GUIStyle(GUI.skin.label);
+          			labelStyle.alignment = TextAnchor.MiddleCenter;
+          			labelStyle.fontStyle = FontStyle.Bold;
+          			labelStyle.normal.textColor = Color.white;
+          		}
+          		float num = (float)Screen.height / 720f;
+          		labelStyle.fontSize = Mathf.RoundToInt(24f * num);
+          		for (int i = 0; i < buttons.Count; i++)
+          		{
+          			TouchButton touchButton = buttons[i];
+          			bool flag = held.Contains(touchButton.id);
+          			GUI.color = (flag ? new Color(1f, 1f, 1f, 0.55f) : new Color(1f, 1f, 1f, 0.28f));
+          			Rect position = new Rect(touchButton.center.x - touchButton.radius, (float)Screen.height - touchButton.center.y - touchButton.radius, touchButton.radius * 2f, touchButton.radius * 2f);
+          			GUI.DrawTexture(position, circleTex);
+          			GUI.color = Color.white;
+          			GUI.Label(position, touchButton.label, labelStyle);
+          		}
+          		if (joyFinger >= 0)
+          		{
+          			float num2 = 90f * num;
+          			GUI.color = new Color(1f, 1f, 1f, 0.18f);
+          			GUI.DrawTexture(new Rect(joyOrigin.x - num2, (float)Screen.height - joyOrigin.y - num2, num2 * 2f, num2 * 2f), circleTex);
+          			float num3 = 40f * num;
+          			Vector2 vector = joyOrigin + joyVector * num2;
+          			GUI.color = new Color(1f, 1f, 1f, 0.5f);
+          			GUI.DrawTexture(new Rect(vector.x - num3, (float)Screen.height - vector.y - num3, num3 * 2f, num3 * 2f), circleTex);
+          			GUI.color = Color.white;
+          		}
+          	}
+          }
+          EOF
+          cat > "$SCRIPTS/BasicallyRewiredDataStore.cs" << 'EOF'
+          using Rewired.Data;
+
+          public class BasicallyRewiredDataStore : UserDataStore_File
+          {
+          	private static BasicallyRewiredDataStore instance;
+
+          	public static void SetSaveFile(string fileName)
+          	{
+          		if (instance == null)
+          		{
+          			return;
+          		}
+          		instance.fileName = "RewiredSaveData_" + fileName + ".json";
+          		instance.Load();
+          	}
+
+          	public static void SetDefaults(string fileName)
+          	{
+          		if (instance == null)
+          		{
+          			return;
+          		}
+          		SetSaveFile(fileName);
+          		instance.ClearSaveData();
+          		SetSaveFile(fileName);
+          	}
+
+          	protected override void SetInitialValues()
+          	{
+          		base.SetInitialValues();
+          		instance = this;
+          	}
+          }
+          EOF
+          sed -i 's/m_bInitialized = SteamAPI.Init();/m_bInitialized = false;/' "$SCRIPTS/SteamManager.cs"
+          grep -q "m_bInitialized = false;" "$SCRIPTS/SteamManager.cs" || { echo "ERROR: Steam patch failed"; exit 1; }
+          echo "Patched InputManager, BasicallyRewiredDataStore and SteamManager"
 
       - name: Add build script
         run: |
@@ -165,15 +614,15 @@ jobs:
           grep -E "error CS|CIBuild:|Build Finished|Error building|BuildFailed|Gradle build failed" unity.log | sort -u | head -n 60 || true
           tail -n 30 unity.log || true
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: game-apk
-          path: apk/game.apk
-          if-no-files-found: error
+      - name: Publish APK to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "apk-${{ github.run_number }}" apk/game.apk --repo ${{ github.repository }} --title "APK build ${{ github.run_number }}" --notes "Android build"
 
       - name: Upload Unity log
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: unity-log
