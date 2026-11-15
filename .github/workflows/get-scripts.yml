@@ -64,9 +64,16 @@ jobs:
           ls -lh out/game-scripts.zip
           find "$SRC" -name "*.cs" | wc -l
 
+      - name: List input names used by scenes and prefabs
+        run: |
+          grep -rhE "^\s+(xAnalogId|yAnalogId|xDeltaId|yDeltaId|steamAnalogId|steamDeltaId):" export/ExportedProject/Assets --include=*.prefab --include=*.unity | sed -E 's/^ +//' | sort | uniq -c | sort -rn > out/input-ids.txt || true
+          echo "---- scenes ----" >> out/input-ids.txt
+          ls export/ExportedProject/Assets/Scenes >> out/input-ids.txt 2>/dev/null || true
+          cat out/input-ids.txt
+
       - name: Publish scripts to a release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete scripts --repo ${{ github.repository }} --yes --cleanup-tag || true
-          gh release create scripts out/game-scripts.zip --repo ${{ github.repository }} --title "Game scripts" --notes "Decompiled game scripts"
+          gh release create scripts out/game-scripts.zip out/input-ids.txt --repo ${{ github.repository }} --title "Game scripts" --notes "Decompiled game scripts"
