@@ -11,6 +11,14 @@ on:
           - Hybrid
           - Decompiled
           - DllExportWithoutRenaming
+      shader_mode:
+        description: "How AssetRipper exports the game's shaders"
+        type: choice
+        default: Decompile
+        options:
+          - Decompile
+          - Yaml
+          - Dummy
 
 jobs:
   build:
@@ -62,8 +70,10 @@ jobs:
             sleep 2
           done
           echo "Set script mode: ${{ inputs.script_mode }}"
+          echo "Set shader mode: ${{ inputs.shader_mode }}"
           curl -s -o /dev/null -w "settings http %{http_code}\n" -X POST \
             --data-urlencode "ScriptExportMode=${{ inputs.script_mode }}" \
+            --data-urlencode "ShaderExportMode=${{ inputs.shader_mode }}" \
             http://127.0.0.1:5000/Settings/Update
           curl -s -o /dev/null -w "load http %{http_code}\n" --max-time 600 -X POST \
             --data-urlencode "Path=$GAMEDIR" http://127.0.0.1:5000/LoadFolder
@@ -72,6 +82,9 @@ jobs:
           sleep 5
           pkill -f AssetRipper || true
           grep -m1 "ScriptExportMode" ar.log || true
+          grep -m1 "ShaderExportMode" ar.log || true
+          echo "shader files: $(find export/ExportedProject/Assets -name '*.shader' | wc -l), tiny ones (under 2 KB): $(find export/ExportedProject/Assets -name '*.shader' -size -2k | wc -l)"
+          ls -l export/ExportedProject/Assets/Shader | grep -i -E "PixelFilter|SpriteStandard|Standard.shader" || true
           test -d export/ExportedProject/Assets || { echo "ERROR: export failed"; tail -n 40 ar.log; exit 1; }
           test -d export/ExportedProject/ProjectSettings || { echo "ERROR: no ProjectSettings"; exit 1; }
           du -sh export
@@ -181,7 +194,7 @@ jobs:
 
           	private IEnumerator LogDiagnostics()
           	{
-          		for (int i = 0; i < 8; i++)
+          		for (int i = 0; i < 12; i++)
           		{
           			yield return new WaitForSecondsRealtime(4f);
           			LogRenderState();
@@ -194,6 +207,30 @@ jobs:
           		UnityEngine.Rendering.RenderPipelineAsset renderPipelineAsset = UnityEngine.Rendering.GraphicsSettings.renderPipelineAsset;
           		text = text + " pipeline=" + ((renderPipelineAsset == null) ? "none" : renderPipelineAsset.GetType().Name);
           		Debug.Log(text);
+          		GlobalCam instance = Singleton<GlobalCam>.Instance;
+          		if (instance != null)
+          		{
+          			Debug.Log("DIAG globalcam transitionActive=" + instance.TransitionActive + " camEnabled=" + instance.Cam.enabled + " renderTexCamEnabled=" + instance.RenderTexCam.enabled);
+          		}
+          		Canvas[] array = UnityEngine.Object.FindObjectsOfType<Canvas>();
+          		for (int k = 0; k < array.Length; k++)
+          		{
+          			Canvas canvas = array[k];
+          			string text3 = (canvas.worldCamera == null) ? "none" : canvas.worldCamera.name;
+          			Debug.Log("DIAG canvas " + canvas.name + " mode=" + canvas.renderMode + " enabled=" + canvas.enabled + " order=" + canvas.sortingOrder + " camera=" + text3 + " graphics=" + canvas.GetComponentsInChildren<UnityEngine.UI.Graphic>().Length);
+          		}
+          		UnityEngine.UI.RawImage[] array2 = UnityEngine.Object.FindObjectsOfType<UnityEngine.UI.RawImage>();
+          		for (int m = 0; m < array2.Length; m++)
+          		{
+          			UnityEngine.UI.RawImage rawImage = array2[m];
+          			string text4 = (rawImage.texture == null) ? "none" : (rawImage.texture.name + " " + rawImage.texture.width + "x" + rawImage.texture.height);
+          			string text5 = "none";
+          			if (rawImage.material != null && rawImage.material.shader != null)
+          			{
+          				text5 = rawImage.material.shader.name + " supported=" + rawImage.material.shader.isSupported;
+          			}
+          			Debug.Log("DIAG rawimage " + rawImage.name + " active=" + rawImage.gameObject.activeInHierarchy + " texture=" + text4 + " shader=" + text5 + " color=" + rawImage.color);
+          		}
           		Camera[] allCameras = Camera.allCameras;
           		for (int j = 0; j < allCameras.Length; j++)
           		{
