@@ -6,6 +6,8 @@ on:
 jobs:
   scripts:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Download and unzip game
         env:
@@ -62,8 +64,9 @@ jobs:
           ls -lh out/game-scripts.zip
           find "$SRC" -name "*.cs" | wc -l
 
-      - name: Upload scripts
-        uses: actions/upload-artifact@v4
-        with:
-          name: game-scripts
-          path: out/game-scripts.zip
+      - name: Publish scripts to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete scripts --repo ${{ github.repository }} --yes --cleanup-tag || true
+          gh release create scripts out/game-scripts.zip --repo ${{ github.repository }} --title "Game scripts" --notes "Decompiled game scripts"
