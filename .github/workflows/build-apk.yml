@@ -83,7 +83,7 @@ jobs:
           unity-version: 2020.3.49f1
           build-targets: Android
           hub-version: '3.14.3'
-          cache-installation: false
+          cache-installation: true
 
       - name: Activate Personal license
         uses: RageAgainstThePixel/activate-unity-license@v2
@@ -105,6 +105,7 @@ jobs:
           echo "Scripts folder: $SCRIPTS"
           test -f "$SCRIPTS/InputManager.cs" || { echo "ERROR: InputManager.cs not found"; exit 1; }
           cat > "$SCRIPTS/InputManager.cs" << 'EOF'
+          using System.Collections;
           using System.Collections.Generic;
           using Steamworks;
           using UnityEngine;
@@ -175,6 +176,35 @@ jobs:
           		Input.simulateMouseWithTouches = false;
           		Input.multiTouchEnabled = true;
           		circleTex = MakeCircle(64);
+          		StartCoroutine(LogDiagnostics());
+          	}
+
+          	private IEnumerator LogDiagnostics()
+          	{
+          		for (int i = 0; i < 8; i++)
+          		{
+          			yield return new WaitForSecondsRealtime(4f);
+          			LogRenderState();
+          		}
+          	}
+
+          	private void LogRenderState()
+          	{
+          		string text = "DIAG scene=" + UnityEngine.SceneManagement.SceneManager.GetActiveScene().name + " api=" + SystemInfo.graphicsDeviceType + " screen=" + Screen.width + "x" + Screen.height + " timeScale=" + Time.timeScale;
+          		UnityEngine.Rendering.RenderPipelineAsset renderPipelineAsset = UnityEngine.Rendering.GraphicsSettings.renderPipelineAsset;
+          		text = text + " pipeline=" + ((renderPipelineAsset == null) ? "none" : renderPipelineAsset.GetType().Name);
+          		Debug.Log(text);
+          		Camera[] allCameras = Camera.allCameras;
+          		for (int j = 0; j < allCameras.Length; j++)
+          		{
+          			Camera camera = allCameras[j];
+          			string text2 = "screen";
+          			if (camera.targetTexture != null)
+          			{
+          				text2 = camera.targetTexture.width + "x" + camera.targetTexture.height + " " + camera.targetTexture.format;
+          			}
+          			Debug.Log("DIAG cam " + camera.name + " depth=" + camera.depth + " mask=" + camera.cullingMask + " target=" + text2);
+          		}
           	}
 
           	private static Texture2D MakeCircle(int size)
@@ -468,6 +498,17 @@ jobs:
           	{
           	}
 
+          	private void DrawDisc(Rect outer, float ringAlpha, float fillAlpha)
+          	{
+          		GUI.color = new Color(1f, 1f, 1f, ringAlpha);
+          		GUI.DrawTexture(outer, circleTex);
+          		float num = outer.width * 0.07f;
+          		Rect position = new Rect(outer.x + num, outer.y + num, outer.width - num * 2f, outer.height - num * 2f);
+          		GUI.color = new Color(0f, 0f, 0f, fillAlpha);
+          		GUI.DrawTexture(position, circleTex);
+          		GUI.color = Color.white;
+          	}
+
           	private void OnGUI()
           	{
           		if (Event.current.type != EventType.Repaint || circleTex == null)
@@ -487,22 +528,18 @@ jobs:
           		{
           			TouchButton touchButton = buttons[i];
           			bool flag = held.Contains(touchButton.id);
-          			GUI.color = (flag ? new Color(1f, 1f, 1f, 0.55f) : new Color(1f, 1f, 1f, 0.28f));
-          			Rect position = new Rect(touchButton.center.x - touchButton.radius, (float)Screen.height - touchButton.center.y - touchButton.radius, touchButton.radius * 2f, touchButton.radius * 2f);
-          			GUI.DrawTexture(position, circleTex);
+          			Rect rect = new Rect(touchButton.center.x - touchButton.radius, (float)Screen.height - touchButton.center.y - touchButton.radius, touchButton.radius * 2f, touchButton.radius * 2f);
+          			DrawDisc(rect, flag ? 0.9f : 0.6f, flag ? 0.7f : 0.45f);
           			GUI.color = Color.white;
-          			GUI.Label(position, touchButton.label, labelStyle);
+          			GUI.Label(rect, touchButton.label, labelStyle);
           		}
           		if (joyFinger >= 0)
           		{
           			float num2 = 90f * num;
-          			GUI.color = new Color(1f, 1f, 1f, 0.18f);
-          			GUI.DrawTexture(new Rect(joyOrigin.x - num2, (float)Screen.height - joyOrigin.y - num2, num2 * 2f, num2 * 2f), circleTex);
+          			DrawDisc(new Rect(joyOrigin.x - num2, (float)Screen.height - joyOrigin.y - num2, num2 * 2f, num2 * 2f), 0.4f, 0.25f);
           			float num3 = 40f * num;
           			Vector2 vector = joyOrigin + joyVector * num2;
-          			GUI.color = new Color(1f, 1f, 1f, 0.5f);
-          			GUI.DrawTexture(new Rect(vector.x - num3, (float)Screen.height - vector.y - num3, num3 * 2f, num3 * 2f), circleTex);
-          			GUI.color = Color.white;
+          			DrawDisc(new Rect(vector.x - num3, (float)Screen.height - vector.y - num3, num3 * 2f, num3 * 2f), 0.8f, 0.6f);
           		}
           	}
           }
@@ -621,11 +658,14 @@ jobs:
           grep -E "error CS|CIBuild:|Build Finished|Error building|BuildFailed|Gradle build failed" unity.log | sort -u | head -n 60 || true
           tail -n 30 unity.log || true
 
-      - name: Publish APK to a release
+      - name: Publish APK and log to a release
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "apk-${{ github.run_number }}" apk/game.apk --repo ${{ github.repository }} --title "APK build ${{ github.run_number }}" --notes "Android build"
+          FILES="unity.log"
+          if [ -f apk/game.apk ]; then FILES="apk/game.apk unity.log"; fi
+          gh release create "build-${{ github.run_number }}" $FILES --repo ${{ github.repository }} --title "Build ${{ github.run_number }}" --notes "Android build"
 
       - name: Upload Unity log
         if: always()
