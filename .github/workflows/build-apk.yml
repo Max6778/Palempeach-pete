@@ -92,6 +92,13 @@ jobs:
           username: ${{ secrets.UNITY_EMAIL }}
           password: ${{ secrets.UNITY_PASSWORD }}
 
+      - name: Install libssl1.1 for Unity's C# compiler
+        run: |
+          echo "deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://security.ubuntu.com/ubuntu focal-security main" | sudo tee /etc/apt/sources.list.d/focal-security.list
+          sudo apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/focal-security.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
+          sudo apt-get install -y libssl1.1
+          ldconfig -p | grep "libssl.so.1.1" || { echo "ERROR: libssl1.1 not installed"; exit 1; }
+
       - name: Patch game scripts for Android
         run: |
           SCRIPTS=$(find export/ExportedProject/Assets -type d -name "Assembly-CSharp" | head -n 1)
