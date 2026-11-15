@@ -14,11 +14,11 @@ on:
       shader_mode:
         description: "How AssetRipper exports the game's shaders"
         type: choice
-        default: Decompile
+        default: Dummy
         options:
+          - Dummy
           - Decompile
           - Yaml
-          - Dummy
 
 jobs:
   build:
@@ -207,10 +207,44 @@ jobs:
           		UnityEngine.Rendering.RenderPipelineAsset renderPipelineAsset = UnityEngine.Rendering.GraphicsSettings.renderPipelineAsset;
           		text = text + " pipeline=" + ((renderPipelineAsset == null) ? "none" : renderPipelineAsset.GetType().Name);
           		Debug.Log(text);
+          		if (renderPipelineAsset != null)
+          		{
+          			try
+          			{
+          				object obj = null;
+          				System.Reflection.PropertyInfo property = renderPipelineAsset.GetType().GetProperty("scriptableRenderer");
+          				if (property != null)
+          				{
+          					obj = property.GetValue(renderPipelineAsset, null);
+          				}
+          				Debug.Log("DIAG urp renderer=" + ((obj == null) ? "null" : obj.GetType().Name) + " blitShaderFound=" + (Shader.Find("Hidden/Universal Render Pipeline/Blit") != null));
+          			}
+          			catch (System.Exception ex)
+          			{
+          				Debug.Log("DIAG urp error " + ex.Message);
+          			}
+          		}
           		GlobalCam instance = Singleton<GlobalCam>.Instance;
           		if (instance != null)
           		{
           			Debug.Log("DIAG globalcam transitionActive=" + instance.TransitionActive + " camEnabled=" + instance.Cam.enabled + " renderTexCamEnabled=" + instance.RenderTexCam.enabled);
+          			RenderTexture targetTexture = instance.Cam.targetTexture;
+          			if (targetTexture != null)
+          			{
+          				RenderTexture active = RenderTexture.active;
+          				RenderTexture.active = targetTexture;
+          				Texture2D texture2D = new Texture2D(1, 1, TextureFormat.RGBA32, false);
+          				string text6 = "";
+          				for (int n = 1; n <= 3; n++)
+          				{
+          					texture2D.ReadPixels(new Rect(targetTexture.width * n / 4, targetTexture.height / 2, 1f, 1f), 0, 0);
+          					texture2D.Apply();
+          					text6 = text6 + texture2D.GetPixel(0, 0).ToString() + " ";
+          				}
+          				RenderTexture.active = active;
+          				UnityEngine.Object.Destroy(texture2D);
+          				Debug.Log("DIAG rt " + targetTexture.width + "x" + targetTexture.height + " created=" + targetTexture.IsCreated() + " samples=" + text6);
+          			}
           		}
           		Canvas[] array = UnityEngine.Object.FindObjectsOfType<Canvas>();
           		for (int k = 0; k < array.Length; k++)
@@ -558,6 +592,16 @@ jobs:
           			labelStyle.alignment = TextAnchor.MiddleCenter;
           			labelStyle.fontStyle = FontStyle.Bold;
           			labelStyle.normal.textColor = Color.white;
+          		}
+          		GlobalCam globalCam = Singleton<GlobalCam>.Instance;
+          		if (globalCam != null && globalCam.Cam != null && globalCam.Cam.targetTexture != null)
+          		{
+          			RenderTexture targetTexture = globalCam.Cam.targetTexture;
+          			float num4 = Mathf.Min((float)Screen.width / (float)targetTexture.width, (float)Screen.height / (float)targetTexture.height);
+          			float num5 = (float)targetTexture.width * num4;
+          			float num6 = (float)targetTexture.height * num4;
+          			GUI.color = Color.white;
+          			GUI.DrawTexture(new Rect(((float)Screen.width - num5) / 2f, ((float)Screen.height - num6) / 2f, num5, num6), targetTexture, ScaleMode.StretchToFill, true);
           		}
           		float num = (float)Screen.height / 720f;
           		labelStyle.fontSize = Mathf.RoundToInt(24f * num);
