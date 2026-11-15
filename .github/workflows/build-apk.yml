@@ -83,7 +83,7 @@ jobs:
           unity-version: 2020.3.49f1
           build-targets: Android
           hub-version: '3.14.3'
-          cache-installation: true
+          cache-installation: false
 
       - name: Activate Personal license
         uses: RageAgainstThePixel/activate-unity-license@v2
