@@ -185,6 +185,7 @@ jobs:
           	protected override void AwakeFunction()
           	{
           		base.AwakeFunction();
+          		UrpFix.Apply();
           		Debug.Log("Initializing touch input management.");
           		Input.simulateMouseWithTouches = false;
           		Input.multiTouchEnabled = true;
@@ -212,7 +213,7 @@ jobs:
           			try
           			{
           				object obj = null;
-          				System.Reflection.PropertyInfo property = renderPipelineAsset.GetType().GetProperty("scriptableRenderer");
+          				System.Reflection.PropertyInfo property = renderPipelineAsset.GetType().GetProperty("scriptableRenderer", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
           				if (property != null)
           				{
           					obj = property.GetValue(renderPipelineAsset, null);
@@ -663,6 +664,355 @@ jobs:
           sed -i 's/m_bInitialized = SteamAPI.Init();/m_bInitialized = false;/' "$SCRIPTS/SteamManager.cs"
           grep -q "m_bInitialized = false;" "$SCRIPTS/SteamManager.cs" || { echo "ERROR: Steam patch failed"; exit 1; }
           echo "Patched InputManager, BasicallyRewiredDataStore and SteamManager"
+
+      - name: Patch camera data for Android
+        run: |
+          cat > patch_cameras.py << 'EOF'
+          import os, subprocess
+
+          d = subprocess.run("find export/ExportedProject/Assets -type d -name Assembly-CSharp | head -n 1", shell=True, capture_output=True, text=True).stdout.strip()
+          if os.environ.get("SCRIPTS_DIR"):
+              d = os.environ["SCRIPTS_DIR"]
+          print("Scripts folder:", d)
+
+
+          def patch(name, fn):
+              p = os.path.join(d, name)
+              s = open(p, newline="").read().replace("\r\n", "\n")
+              s2 = fn(s)
+              assert s2 != s, "no change made to " + name
+              open(p, "w", newline="").write(s2)
+              print("patched", name)
+
+
+          def patch_global_cam(s):
+              old = "\t\tcameraData.renderType = type;\n"
+              assert s.count(old) == 1, "GlobalCam pattern"
+              new = "\t\tif (cameraData == null)\n\t\t{\n\t\t\tcameraData = renderTexCam.GetUniversalAdditionalCameraData();\n\t\t}\n" + old
+              return s.replace(old, new)
+
+
+          METHODS = '''	public static void SetUrp(Camera cam, CameraRenderType type, bool clearDepth)
+          	{
+          		if (cam == null)
+          		{
+          			return;
+          		}
+          		UniversalAdditionalCameraData universalAdditionalCameraData = cam.GetUniversalAdditionalCameraData();
+          		universalAdditionalCameraData.renderType = type;
+          		System.Reflection.FieldInfo field = typeof(UniversalAdditionalCameraData).GetField("m_ClearDepth", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+          		if (field != null)
+          		{
+          			field.SetValue(universalAdditionalCameraData, clearDepth);
+          		}
+          	}
+
+          	private void FixCameraData()
+          	{
+          		SetUrp(camCom, CameraRenderType.Base, true);
+          		SetUrp(billboardCam, CameraRenderType.Overlay, false);
+          		SetUrp(overlayCam, CameraRenderType.Overlay, true);
+          		SetUrp(canvasCam, CameraRenderType.Overlay, true);
+          		comCamData = camCom.GetUniversalAdditionalCameraData();
+          		canvasCamData = canvasCam.GetUniversalAdditionalCameraData();
+          		comCamData.cameraStack.Clear();
+          		comCamData.cameraStack.Add(billboardCam);
+          		comCamData.cameraStack.Add(overlayCam);
+          		comCamData.cameraStack.Add(canvasCam);
+          	}
+
+          '''
+
+
+          def patch_game_camera(s):
+              old = "\tprivate void Awake()\n\t{\n"
+              assert s.count(old) == 1, "GameCamera Awake pattern"
+              s = s.replace(old, old + "\t\tFixCameraData();\n")
+              marker = "\tpublic void UpdateTargets(Transform trans, int val)\n"
+              assert s.count(marker) == 1, "GameCamera UpdateTargets pattern"
+              return s.replace(marker, METHODS + marker)
+
+
+          def patch_core(s):
+              out = []
+              n = 0
+              for line in s.split("\n"):
+                  out.append(line)
+                  if "cameras[i].mapCam = Object.Instantiate(cameras[i].mapCamPre, ec.map.transform);" in line:
+                      ind = line[: len(line) - len(line.lstrip())]
+                      out.append(ind + "GameCamera.SetUrp(cameras[i].mapCam, CameraRenderType.Overlay, false);")
+                      n += 1
+              assert n == 1, "CoreGameManager pattern"
+              return "\n".join(out)
+
+
+          patch("GlobalCam.cs", patch_global_cam)
+          patch("GameCamera.cs", patch_game_camera)
+          patch("CoreGameManager.cs", patch_core)
+          EOF
+          python3 patch_cameras.py
+
+      - name: Patch URP renderer for Android
+        run: |
+          SCRIPTS=$(find export/ExportedProject/Assets -type d -name "Assembly-CSharp" | head -n 1)
+          test -n "$SCRIPTS" || { echo "ERROR: scripts folder not found"; exit 1; }
+          cat > "$SCRIPTS/UrpFix.cs" << 'EOF_CS'
+          using System;
+          using System.Reflection;
+          using UnityEngine;
+          using UnityEngine.Rendering;
+
+          // Rebuilds the URP renderer at startup. The exported renderer asset cannot be loaded on Android,
+          // so the pipeline has no renderer and draws nothing. This creates a new one in code.
+          public static class UrpFix
+          {
+          	private const BindingFlags All = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+
+          	private static bool applied;
+
+          	[RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+          	private static void Init()
+          	{
+          		Apply();
+          	}
+
+          	public static void Apply()
+          	{
+          		if (applied)
+          		{
+          			return;
+          		}
+          		applied = true;
+          		try
+          		{
+          			RenderPipelineAsset renderPipelineAsset = GraphicsSettings.renderPipelineAsset;
+          			if (renderPipelineAsset == null)
+          			{
+          				Debug.Log("URPFIX: no render pipeline asset");
+          				return;
+          			}
+          			Type type = renderPipelineAsset.GetType();
+          			FieldInfo field = type.GetField("m_RendererDataList", All);
+          			if (field == null)
+          			{
+          				Debug.Log("URPFIX: m_RendererDataList not found");
+          				return;
+          			}
+          			int num = 0;
+          			FieldInfo field2 = type.GetField("m_DefaultRendererIndex", All);
+          			if (field2 != null)
+          			{
+          				num = (int)field2.GetValue(renderPipelineAsset);
+          			}
+          			Array array = field.GetValue(renderPipelineAsset) as Array;
+          			if (array != null && array.Length > num && array.GetValue(num) != null)
+          			{
+          				Debug.Log("URPFIX: renderer data already present");
+          				return;
+          			}
+          			Type type2 = type.Assembly.GetType("UnityEngine.Rendering.Universal.ForwardRendererData");
+          			if (type2 == null)
+          			{
+          				Debug.Log("URPFIX: ForwardRendererData type not found");
+          				return;
+          			}
+          			ScriptableObject scriptableObject = ScriptableObject.CreateInstance(type2);
+          			FillShaders(scriptableObject, type2.GetField("shaders", All));
+          			FieldInfo field3 = type2.GetField("postProcessData", All);
+          			if (field3 != null)
+          			{
+          				ScriptableObject scriptableObject2 = ScriptableObject.CreateInstance(field3.FieldType);
+          				FillShaders(scriptableObject2, field3.FieldType.GetField("shaders", All));
+          				FieldInfo field4 = field3.FieldType.GetField("textures", All);
+          				if (field4 != null && field4.GetValue(scriptableObject2) == null)
+          				{
+          					field4.SetValue(scriptableObject2, Activator.CreateInstance(field4.FieldType));
+          				}
+          				field3.SetValue(scriptableObject, scriptableObject2);
+          			}
+          			FieldInfo field5 = type2.GetField("xrSystemData", All);
+          			if (field5 != null)
+          			{
+          				ScriptableObject scriptableObject3 = ScriptableObject.CreateInstance(field5.FieldType);
+          				FillShaders(scriptableObject3, field5.FieldType.GetField("shaders", All));
+          				field5.SetValue(scriptableObject, scriptableObject3);
+          			}
+          			int num2 = Math.Max(1, (array == null) ? 1 : array.Length);
+          			if (num >= num2)
+          			{
+          				num2 = num + 1;
+          			}
+          			Array array2 = Array.CreateInstance(field.FieldType.GetElementType(), num2);
+          			if (array != null)
+          			{
+          				Array.Copy(array, array2, array.Length);
+          			}
+          			array2.SetValue(scriptableObject, num);
+          			field.SetValue(renderPipelineAsset, array2);
+          			Debug.Log("URPFIX: created a new renderer data at index " + num);
+          		}
+          		catch (Exception ex)
+          		{
+          			Debug.Log("URPFIX: error " + ex);
+          		}
+          	}
+
+          	private static void FillShaders(object owner, FieldInfo shadersField)
+          	{
+          		if (shadersField == null)
+          		{
+          			return;
+          		}
+          		object obj = shadersField.GetValue(owner);
+          		if (obj == null)
+          		{
+          			obj = Activator.CreateInstance(shadersField.FieldType);
+          		}
+          		FieldInfo[] fields = obj.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+          		for (int i = 0; i < fields.Length; i++)
+          		{
+          			if (fields[i].FieldType == typeof(Shader))
+          			{
+          				string text = ShaderName(fields[i].Name);
+          				Shader shader = null;
+          				if (text != null)
+          				{
+          					shader = Shader.Find(text);
+          				}
+          				fields[i].SetValue(obj, shader);
+          				if (shader == null && text != null)
+          				{
+          					Debug.Log("URPFIX: shader not found " + text);
+          				}
+          			}
+          		}
+          		shadersField.SetValue(owner, obj);
+          	}
+
+          	private static string ShaderName(string field)
+          	{
+          		string text = "Hidden/Universal Render Pipeline/";
+          		switch (field)
+          		{
+          		case "blitPS":
+          			return text + "Blit";
+          		case "copyDepthPS":
+          			return text + "CopyDepth";
+          		case "screenSpaceShadowPS":
+          			return text + "ScreenSpaceShadows";
+          		case "samplingPS":
+          			return text + "Sampling";
+          		case "stencilDeferredPS":
+          			return text + "StencilDeferred";
+          		case "fallbackErrorPS":
+          			return text + "FallbackError";
+          		case "materialErrorPS":
+          			return text + "MaterialError";
+          		case "stopNanPS":
+          			return text + "Stop NaN";
+          		case "subpixelMorphologicalAntialiasingPS":
+          			return text + "SubpixelMorphologicalAntialiasing";
+          		case "gaussianDepthOfFieldPS":
+          			return text + "GaussianDepthOfField";
+          		case "bokehDepthOfFieldPS":
+          			return text + "BokehDepthOfField";
+          		case "cameraMotionBlurPS":
+          			return text + "CameraMotionBlur";
+          		case "paniniProjectionPS":
+          			return text + "PaniniProjection";
+          		case "lutBuilderLdrPS":
+          			return text + "LutBuilderLdr";
+          		case "lutBuilderHdrPS":
+          			return text + "LutBuilderHdr";
+          		case "bloomPS":
+          			return text + "Bloom";
+          		case "uberPostPS":
+          			return text + "UberPost";
+          		case "finalPostPS":
+          			return text + "FinalPost";
+          		case "xrOcclusionMeshPS":
+          			return text + "XR/XROcclusionMesh";
+          		case "xrMirrorViewPS":
+          			return text + "XR/XRMirrorView";
+          		default:
+          			return null;
+          		}
+          	}
+          }
+          EOF_CS
+          cat > blit.shader << 'EOF_SHADER'
+          Shader "Hidden/Universal Render Pipeline/Blit"
+          {
+          	Properties
+          	{
+          	}
+          	SubShader
+          	{
+          		Tags { "RenderType" = "Opaque" "RenderPipeline" = "UniversalPipeline" }
+          		LOD 100
+
+          		Pass
+          		{
+          			Name "Blit"
+          			ZTest Always
+          			ZWrite Off
+          			Cull Off
+
+          			HLSLPROGRAM
+          			#pragma vertex Vert
+          			#pragma fragment Frag
+          			#pragma multi_compile _ _USE_DRAW_PROCEDURAL
+          			#pragma multi_compile_fragment _ _LINEAR_TO_SRGB_CONVERSION
+
+          			Texture2D _SourceTex;
+          			SamplerState sampler_SourceTex;
+          			float4 _ScaleBias;
+
+          			struct Attributes
+          			{
+          			#if _USE_DRAW_PROCEDURAL
+          				uint vertexID : SV_VertexID;
+          			#else
+          				float4 pos : POSITION;
+          				float2 uv : TEXCOORD0;
+          			#endif
+          			};
+
+          			struct Varyings
+          			{
+          				float4 pos : SV_POSITION;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			Varyings Vert(Attributes input)
+          			{
+          				Varyings output;
+          			#if _USE_DRAW_PROCEDURAL
+          				float2 t = float2((input.vertexID << 1) & 2, input.vertexID & 2);
+          				output.pos = float4(t * 2.0 - 1.0, 0.0, 1.0);
+          				output.uv = float2(t.x, 1.0 - t.y) * _ScaleBias.xy + _ScaleBias.zw;
+          			#else
+          				output.pos = float4(input.pos.xy, 0.0, 1.0);
+          				output.uv = input.uv;
+          			#endif
+          				return output;
+          			}
+
+          			float4 Frag(Varyings input) : SV_Target
+          			{
+          				float4 col = _SourceTex.Sample(sampler_SourceTex, input.uv);
+          			#ifdef _LINEAR_TO_SRGB_CONVERSION
+          				col.rgb = pow(max(col.rgb, 0.0), 1.0 / 2.2);
+          			#endif
+          				return col;
+          			}
+          			ENDHLSL
+          		}
+          	}
+          }
+          EOF_SHADER
+          BLIT="export/ExportedProject/Assets/Shader/Hidden_Universal Render Pipeline_Blit.shader"
+          if [ -f "$BLIT" ]; then cp blit.shader "$BLIT"; echo "Replaced the Blit shader"; else echo "WARNING: Blit shader file not found"; fi
 
       - name: Add build script
         run: |
