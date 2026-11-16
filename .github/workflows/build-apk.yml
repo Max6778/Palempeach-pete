@@ -222,7 +222,7 @@ jobs:
           			}
           			catch (System.Exception ex)
           			{
-          				Debug.Log("DIAG urp error " + ex.Message);
+          				Debug.Log("DIAG urp error " + ex.ToString());
           			}
           		}
           		GlobalCam instance = Singleton<GlobalCam>.Instance;
@@ -879,14 +879,37 @@ jobs:
           				{
           					shader = Shader.Find(text);
           				}
-          				fields[i].SetValue(obj, shader);
-          				if (shader == null && text != null)
+          				if (shader == null)
           				{
-          					Debug.Log("URPFIX: shader not found " + text);
+          					if (text != null)
+          					{
+          						Debug.Log("URPFIX: shader not found, using a stand-in for " + text);
+          					}
+          					shader = GetFallback();
           				}
+          				fields[i].SetValue(obj, shader);
           			}
           		}
           		shadersField.SetValue(owner, obj);
+          	}
+
+          	private static Shader fallbackShader;
+
+          	private static Shader GetFallback()
+          	{
+          		if (fallbackShader == null)
+          		{
+          			fallbackShader = Shader.Find("Hidden/Universal Render Pipeline/Blit");
+          		}
+          		if (fallbackShader == null)
+          		{
+          			fallbackShader = Shader.Find("Sprites/Default");
+          		}
+          		if (fallbackShader == null)
+          		{
+          			fallbackShader = Shader.Find("UI/Default");
+          		}
+          		return fallbackShader;
           	}
 
           	private static string ShaderName(string field)
