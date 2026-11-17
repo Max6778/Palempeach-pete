@@ -9,4 +9,4 @@ Setup in Termux:
     git clone https://github.com/YOUR_NAME/decompile-hub ~/decompile-hub
     cd ~/decompile-hub && chmod +x decompile.sh
 
-Keep this repo private. Files over 90 MB go through a release asset (limit 2 GB).
+Keep this repo private. Files over 50 MB go through a release asset (limit 2 GB).

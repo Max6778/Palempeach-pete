@@ -47,7 +47,7 @@ upload_and_trigger() { # key file tool : upload, start the workflow, record the 
   SHA8=$(sha256sum "$FILE" | cut -c1-8)
   NAME="${SHA8}_$(basename "$FILE" | tr ' ' '_')"
   SIZE=$(stat -c %s "$FILE")
-  if [ "$SIZE" -gt 94371840 ]; then
+  if [ "$SIZE" -gt 52428800 ]; then
     [ "$SIZE" -gt 2000000000 ] && { echo "Over 2 GB: too big for GitHub releases."; state_set "$KEY" STATE failed; return 1; }
     gh release view big-samples >/dev/null 2>&1 || gh release create big-samples --title big-samples --notes "Large files for decompile workflow" >/dev/null
     if gh release view big-samples --json assets --jq '.assets[].name' | grep -qx "$NAME"; then
@@ -114,7 +114,7 @@ cmd_start() {
   state_set "$KEY" OUT "$OUT"
   state_set "$KEY" FULL "$FULL"
   local SIZE; SIZE=$(stat -c %s "$FILE")
-  if [ "$SIZE" -gt 94371840 ]; then
+  if [ "$SIZE" -gt 52428800 ]; then
     # big file: upload may take minutes, so detach it (needs setsid: pkg install util-linux)
     if command -v setsid >/dev/null; then
       setsid -f bash "$HERE/decompile.sh" _run "$KEY" "$(readlink -f "$FILE")" "$TOOL" > "jobs/$KEY.log" 2>&1 < /dev/null
