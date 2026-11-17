@@ -2211,15 +2211,38 @@ jobs:
           using System.IO;
           using UnityEditor;
           using UnityEditor.Build.Reporting;
+          using UnityEngine;
 
           public static class CIBuild
           {
+              private static void DumpRendererAssets()
+              {
+                  string[] paths = Directory.GetFiles(Application.dataPath, "*.asset", SearchOption.AllDirectories);
+                  foreach (string path in paths)
+                  {
+                      string name = Path.GetFileName(path);
+                      if (name != "AndroidPlusRenderer.asset" && name != "Mask.asset" && name != "Maskable.asset")
+                          continue;
+                      Console.WriteLine("CIBuild: BEGIN_RENDERER_ASSET " + path);
+                      try
+                      {
+                          Console.WriteLine(File.ReadAllText(path));
+                      }
+                      catch (Exception ex)
+                      {
+                          Console.WriteLine("CIBuild: unable to read renderer asset: " + ex.Message);
+                      }
+                      Console.WriteLine("CIBuild: END_RENDERER_ASSET " + name);
+                  }
+              }
+
               public static void BuildAndroid()
               {
                   var scenes = new List<string>();
                   foreach (var s in EditorBuildSettings.scenes)
                       if (s.enabled) scenes.Add(s.path);
                   Console.WriteLine("CIBuild: scenes in build = " + scenes.Count);
+                  DumpRendererAssets();
                   if (scenes.Count == 0)
                   {
                       Console.WriteLine("CIBuild: no scenes found, aborting");
