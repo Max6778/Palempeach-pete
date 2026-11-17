@@ -17,15 +17,28 @@ state_set() { # key name value
   { grep -v "^$2=" "$f" 2>/dev/null || true; echo "$2=$3"; } > "$f.t"; mv "$f.t" "$f"
 }
 
-finish() { # key : download the result of a finished run
+finish() { # key : download summary and requested outputs from the run's release
   . "jobs/$1.state"
+  local TAG ARCHIVES
+  TAG="decompile-${RUN}"
   rm -rf "$OUT"; mkdir -p "$OUT"
-  if gh run download "$RUN" -n summary -D "$OUT" >/dev/null 2>&1; then
-    if [ "$FULL" = 1 ]; then gh run download "$RUN" -n full -D "$OUT/full" >/dev/null 2>&1 || true; fi
-    state_set "$1" STATE done
-  else
+  if ! gh release download "$TAG" -p summary.md -D "$OUT" >/dev/null; then
+    echo "Could not download summary from release $TAG"
     state_set "$1" STATE failed
+    return
   fi
+  if [ "$FULL" = 1 ]; then
+    ARCHIVES="$OUT/.archives"
+    mkdir -p "$ARCHIVES" "$OUT/full"
+    if gh release download "$TAG" -p '*-output.tar.gz' -D "$ARCHIVES" >/dev/null 2>&1; then
+      for archive in "$ARCHIVES"/*-output.tar.gz; do
+        [ -f "$archive" ] || continue
+        tar -xzf "$archive" -C "$OUT/full"
+      done
+    fi
+    rm -rf "$ARCHIVES"
+  fi
+  state_set "$1" STATE done
 }
 
 upload_and_trigger() { # key file tool : upload, start the workflow, record the REAL run id

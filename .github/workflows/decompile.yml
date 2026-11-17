@@ -1,4 +1,6 @@
 name: decompile
+permissions:
+  contents: read
 on:
   workflow_dispatch:
     inputs:
@@ -41,9 +43,37 @@ jobs:
           case "${F,,}" in *.apk) APK=true ;; esac
           { echo "jadx=$JADX"; echo "ghidra=$GHIDRA"; echo "kuna=$KUNA"; echo "rizin=$RIZIN"; echo "apk=$APK"; } >> "$GITHUB_OUTPUT"
 
-  info:
+  release:
     needs: plan
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.create.outputs.tag }}
+    steps:
+      - name: Create a unique results release
+        id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_INPUT: ${{ inputs.target }}
+          TOOL_INPUT: ${{ inputs.tool }}
+        run: |
+          TAG="decompile-${GITHUB_RUN_ID}"
+          cat > release-notes.md <<EOF
+          Target: ${TARGET_INPUT}
+          Tool: ${TOOL_INPUT}
+          Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "Decompile run ${GITHUB_RUN_NUMBER}" \
+            --notes-file release-notes.md
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  info:
+    needs: [plan, release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Fetch target
@@ -86,15 +116,22 @@ jobs:
           else
             echo "Not a .NET file, skipping"
           fi
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: out-info
-          path: out/
-          if-no-files-found: ignore
-
+      - name: Publish info output to the run release
+        if: always() && needs.release.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          if [ ! -d out ] || [ -z "$(find out -type f -print -quit)" ]; then
+            echo "No info output to publish"
+            exit 0
+          fi
+          tar -czf "info-output.tar.gz" -C out .
+          gh release upload "$RELEASE_TAG" "info-output.tar.gz" --repo "$GITHUB_REPOSITORY"
   jadx:
-    needs: plan
+    needs: [plan, release]
+    permissions:
+      contents: write
     if: needs.plan.outputs.jadx == 'true'
     runs-on: ubuntu-24.04
     steps:
@@ -124,15 +161,22 @@ jobs:
           mkdir -p out/jadx
           export JADX_OPTS="-Xmx10g"
           ./jadx/bin/jadx -d out/jadx "$TARGET" || true
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: out-jadx
-          path: out/
-          if-no-files-found: ignore
-
+      - name: Publish jadx output to the run release
+        if: always() && needs.release.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          if [ ! -d out ] || [ -z "$(find out -type f -print -quit)" ]; then
+            echo "No jadx output to publish"
+            exit 0
+          fi
+          tar -czf "jadx-output.tar.gz" -C out .
+          gh release upload "$RELEASE_TAG" "jadx-output.tar.gz" --repo "$GITHUB_REPOSITORY"
   apktool:
-    needs: plan
+    needs: [plan, release]
+    permissions:
+      contents: write
     if: needs.plan.outputs.apk == 'true'
     runs-on: ubuntu-24.04
     steps:
@@ -151,15 +195,22 @@ jobs:
         run: |
           wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O apktool.jar
           java -jar apktool.jar d -f -o out/apktool "$TARGET"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: out-apktool
-          path: out/
-          if-no-files-found: ignore
-
+      - name: Publish apktool output to the run release
+        if: always() && needs.release.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          if [ ! -d out ] || [ -z "$(find out -type f -print -quit)" ]; then
+            echo "No apktool output to publish"
+            exit 0
+          fi
+          tar -czf "apktool-output.tar.gz" -C out .
+          gh release upload "$RELEASE_TAG" "apktool-output.tar.gz" --repo "$GITHUB_REPOSITORY"
   ghidra:
-    needs: plan
+    needs: [plan, release]
+    permissions:
+      contents: write
     if: needs.plan.outputs.ghidra == 'true'
     runs-on: ubuntu-24.04
     steps:
@@ -200,15 +251,22 @@ jobs:
             -scriptPath ghidra_scripts \
             -postScript DecompileAll.java "$PWD/out/ghidra/decompiled.c" \
             -deleteProject
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: out-ghidra
-          path: out/
-          if-no-files-found: ignore
-
+      - name: Publish ghidra output to the run release
+        if: always() && needs.release.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          if [ ! -d out ] || [ -z "$(find out -type f -print -quit)" ]; then
+            echo "No ghidra output to publish"
+            exit 0
+          fi
+          tar -czf "ghidra-output.tar.gz" -C out .
+          gh release upload "$RELEASE_TAG" "ghidra-output.tar.gz" --repo "$GITHUB_REPOSITORY"
   kuna:
-    needs: plan
+    needs: [plan, release]
+    permissions:
+      contents: write
     if: needs.plan.outputs.kuna == 'true'
     runs-on: ubuntu-24.04
     steps:
@@ -261,41 +319,51 @@ jobs:
           cd out/kuna
           "$GITHUB_WORKSPACE/$KUNA" decompile-project "$(basename "$TARGET")" || true
           rm -f "$(basename "$TARGET")"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: out-kuna
-          path: out/
-          if-no-files-found: ignore
-
+      - name: Publish kuna output to the run release
+        if: always() && needs.release.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          if [ ! -d out ] || [ -z "$(find out -type f -print -quit)" ]; then
+            echo "No kuna output to publish"
+            exit 0
+          fi
+          tar -czf "kuna-output.tar.gz" -C out .
+          gh release upload "$RELEASE_TAG" "kuna-output.tar.gz" --repo "$GITHUB_REPOSITORY"
   summary:
-    needs: [plan, info, jadx, apktool, ghidra, kuna]
+    needs: [plan, release, info, jadx, apktool, ghidra, kuna]
     if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - name: Collect outputs
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          pattern: out-*
-          merge-multiple: true
-          path: out
-      - name: Build summary
+      - name: Write and publish run summary
+        if: always() && needs.release.result == 'success'
         env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
           TARGET_INPUT: ${{ inputs.target }}
-          R_INFO: ${{ needs.info.result }}
-          R_JADX: ${{ needs.jadx.result }}
-          R_APKTOOL: ${{ needs.apktool.result }}
-          R_GHIDRA: ${{ needs.ghidra.result }}
-          R_KUNA: ${{ needs.kuna.result }}
-        run: bash scripts/summarize.sh
-      - uses: actions/upload-artifact@v4
-        with:
-          name: summary
-          path: out/summary.md
-      - uses: actions/upload-artifact@v4
-        with:
-          name: full
-          path: out/
-          retention-days: 7
+          TOOL_INPUT: ${{ inputs.tool }}
+          RESULT_INFO: ${{ needs.info.result }}
+          RESULT_JADX: ${{ needs.jadx.result }}
+          RESULT_APKTOOL: ${{ needs.apktool.result }}
+          RESULT_GHIDRA: ${{ needs.ghidra.result }}
+          RESULT_KUNA: ${{ needs.kuna.result }}
+        run: |
+          cat > summary.md <<EOF
+          # Decompile run ${GITHUB_RUN_NUMBER}
+
+          - Target: ${TARGET_INPUT}
+          - Requested tool: ${TOOL_INPUT}
+          - Info: ${RESULT_INFO}
+          - JADX: ${RESULT_JADX}
+          - Apktool: ${RESULT_APKTOOL}
+          - Ghidra: ${RESULT_GHIDRA}
+          - Kuna: ${RESULT_KUNA}
+
+          Full outputs are attached to this release as *-output.tar.gz files.
+          Release: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}
+          Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          gh release upload "$RELEASE_TAG" summary.md --repo "$GITHUB_REPOSITORY"
