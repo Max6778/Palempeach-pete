@@ -152,6 +152,20 @@ jobs:
                           print("    GUID_PATH", ref.group(1), meta_to_asset[ref.group(1)])
           PY
 
+      - name: Preserve the original Plus renderer for Android runtime loading
+        run: |
+          ASSETS=export/ExportedProject/Assets
+          RENDERER=$(find "$ASSETS" -type f -name "UniversalRenderPipelineAsset_Renderer.asset" | head -n 1)
+          if [ -n "$RENDERER" ]; then
+            mkdir -p "$ASSETS/Resources"
+            DEST="$ASSETS/Resources/AndroidPlusRenderer.asset"
+            mv "$RENDERER" "$DEST"
+            if [ -f "$RENDERER.meta" ]; then mv "$RENDERER.meta" "$DEST.meta"; fi
+            echo "Moved original renderer asset to Resources with its GUID: $DEST"
+          else
+            echo "WARNING: original URP renderer asset not found; runtime will use the fallback renderer"
+          fi
+
       - name: Install Unity 2020.3.49f1 with Android
         uses: RageAgainstThePixel/unity-setup@v2
         with:
@@ -1132,12 +1146,12 @@ jobs:
           test -n "$SCRIPTS" || { echo "ERROR: scripts folder not found"; exit 1; }
           cat > "$SCRIPTS/UrpFix.cs" << 'EOF_CS'
           using System;
+          using System.Collections;
           using System.Reflection;
           using UnityEngine;
           using UnityEngine.Rendering;
 
-          // Rebuilds the URP renderer at startup. The exported renderer asset cannot be loaded on Android,
-          // so the pipeline has no renderer and draws nothing. This creates a new one in code.
+          // Restore the exported Plus renderer when possible; create a basic renderer only as a fallback.
           public static class UrpFix
           {
           	private const BindingFlags All = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
@@ -1178,19 +1192,33 @@ jobs:
           			{
           				num = (int)field2.GetValue(renderPipelineAsset);
           			}
-          			Array array = field.GetValue(renderPipelineAsset) as Array;
-          			if (array != null && array.Length > num && array.GetValue(num) != null)
-          			{
-          				Debug.Log("URPFIX: renderer data already present");
-          				return;
-          			}
-          			Type type2 = type.Assembly.GetType("UnityEngine.Rendering.Universal.ForwardRendererData");
-          			if (type2 == null)
-          			{
-          				Debug.Log("URPFIX: ForwardRendererData type not found");
-          				return;
-          			}
-          			ScriptableObject scriptableObject = ScriptableObject.CreateInstance(type2);
+                      Array array = field.GetValue(renderPipelineAsset) as Array;
+                      if (array != null && array.Length > num && array.GetValue(num) != null)
+                      {
+                          Debug.Log("URPFIX: renderer data already present: " + array.GetValue(num).GetType().Name);
+                          return;
+                      }
+                      Type type2 = type.Assembly.GetType("UnityEngine.Rendering.Universal.ForwardRendererData");
+                      if (type2 == null)
+                      {
+                          Debug.Log("URPFIX: ForwardRendererData type not found");
+                          return;
+                      }
+                      UnityEngine.Object originalRenderer = Resources.Load("AndroidPlusRenderer");
+                      if (originalRenderer != null && type2.IsInstanceOfType(originalRenderer))
+                      {
+                          int rendererLength = Math.Max(1, (array == null) ? 1 : array.Length);
+                          if (num >= rendererLength) rendererLength = num + 1;
+                          Array restored = Array.CreateInstance(field.FieldType.GetElementType(), rendererLength);
+                          if (array != null) Array.Copy(array, restored, array.Length);
+                          restored.SetValue(originalRenderer, num);
+                          field.SetValue(renderPipelineAsset, restored);
+                          LogRendererFeatures(originalRenderer, type2);
+                          Debug.Log("URPFIX: restored original Plus renderer from Resources");
+                          return;
+                      }
+                      Debug.Log("URPFIX: original Plus renderer resource unavailable; using fallback. resource=" + ((originalRenderer == null) ? "null" : originalRenderer.GetType().FullName));
+                      ScriptableObject scriptableObject = ScriptableObject.CreateInstance(type2);
           			FillShaders(scriptableObject, type2.GetField("shaders", All));
           			FieldInfo field3 = type2.GetField("postProcessData", All);
           			if (field3 != null)
@@ -1231,7 +1259,19 @@ jobs:
           		}
           	}
 
-          	private static void FillShaders(object owner, FieldInfo shadersField)
+              private static void LogRendererFeatures(object rendererData, Type rendererType)
+              {
+                  FieldInfo featuresField = rendererType.GetField("rendererFeatures", All) ?? rendererType.GetField("m_RendererFeatures", All);
+                  IList features = (featuresField == null) ? null : featuresField.GetValue(rendererData) as IList;
+                  Debug.Log("URPFIX: original renderer features=" + ((features == null) ? "unavailable" : features.Count.ToString()));
+                  if (features == null) return;
+                  for (int i = 0; i < features.Count; i++)
+                  {
+                      UnityEngine.Object feature = features[i] as UnityEngine.Object;
+                      Debug.Log("URPFIX: original renderer feature[" + i + "]=" + ((feature == null) ? "null" : feature.name + "/" + feature.GetType().Name));
+                  }
+              }
+              private static void FillShaders(object owner, FieldInfo shadersField)
           	{
           		if (shadersField == null)
           		{
