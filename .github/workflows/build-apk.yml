@@ -117,6 +117,103 @@ jobs:
           SCRIPTS=$(find export/ExportedProject/Assets -type d -name "Assembly-CSharp" | head -n 1)
           echo "Scripts folder: $SCRIPTS"
           test -f "$SCRIPTS/InputManager.cs" || { echo "ERROR: InputManager.cs not found"; exit 1; }
+          ASSETS="$(dirname "$(dirname "$SCRIPTS")")"
+          STREAMING="$ASSETS/StreamingAssets"
+          RESOURCE_DIR="$ASSETS/Resources/BaldiStreaming"
+          mkdir -p "$RESOURCE_DIR"
+          for name in Subtitles_En.json Subtitles_Fr.json; do
+            test -s "$STREAMING/$name" || { echo "ERROR: missing $STREAMING/$name"; exit 1; }
+            cp "$STREAMING/$name" "$RESOURCE_DIR/$name"
+          done
+          cat > "$SCRIPTS/LocalizationManager.cs" << 'EOF_LOC'
+          using System.Collections.Generic;
+          using System.IO;
+          using UnityCipher;
+          using UnityEngine;
+
+          public class LocalizationManager : Singleton<LocalizationManager>
+          {
+           private Dictionary<string, string> localizedText;
+           private Language currentSubLang;
+           private Language currentAudLang;
+           private Language currentTextureLang;
+
+           protected override void AwakeFunction()
+           {
+            base.AwakeFunction();
+            LoadLocalizedText("Subtitles_En.json", Language.English);
+           }
+
+           public void UpdateCurrentLanguage(Language language) { currentAudLang = language; }
+           public void UpdateCurrentTextureLanguage(Language language) { currentTextureLang = language; }
+
+           public void LoadLocalizedText(string fileName, Language language)
+           {
+            currentSubLang = language;
+            localizedText = new Dictionary<string, string>();
+            string resourceName = "BaldiStreaming/" + Path.GetFileNameWithoutExtension(fileName);
+            TextAsset embedded = Resources.Load<TextAsset>(resourceName);
+            string json = embedded == null ? null : embedded.text;
+            if (string.IsNullOrEmpty(json) && !Application.isMobilePlatform)
+            {
+             string path = Path.Combine(Application.streamingAssetsPath, fileName);
+             if (File.Exists(path)) json = File.ReadAllText(path);
+            }
+            if (string.IsNullOrEmpty(json))
+            {
+             Debug.LogError("Localization text could not be loaded: " + fileName);
+             return;
+            }
+            LocalizationData data = JsonUtility.FromJson<LocalizationData>(json);
+            if (data == null || data.items == null)
+            {
+             Debug.LogError("Localization JSON is invalid: " + fileName);
+             return;
+            }
+            for (int i = 0; i < data.items.Length; i++)
+            {
+             if (data.items[i] != null && !string.IsNullOrEmpty(data.items[i].key))
+              localizedText[data.items[i].key] = data.items[i].value ?? string.Empty;
+            }
+            Debug.Log("Loaded " + localizedText.Count + " localization strings from " + fileName);
+           }
+
+           public string GetLocalizedText(string key) { return GetLocalizedText(key, false); }
+
+           public string GetLocalizedText(string key, bool encrypted)
+           {
+            if (localizedText == null) LoadLocalizedText("Subtitles_En.json", Language.English);
+            if (key != null && localizedText != null && localizedText.TryGetValue(key, out string value))
+             return encrypted ? RijndaelEncryption.Decrypt(value, "baldi") : value;
+            return key;
+           }
+
+           public AudioClip GetLocalizedAudioClip(SoundObject sound)
+           {
+            AudioClip clip = currentAudLang switch
+            {
+             Language.English => sound.soundClip,
+             Language.Test => sound.testLanguageClip,
+             Language.French => sound.frenchClip,
+             Language.Japanese => sound.japaneseClip,
+             _ => sound.soundClip,
+            };
+            return clip == null ? sound.soundClip : clip;
+           }
+
+           public Material[] GetLocalizedPoster(PosterObject poster)
+           {
+            return currentTextureLang switch
+            {
+             Language.English => poster.material,
+             Language.Test => poster.testMaterial,
+             Language.French => poster.frenchMaterial,
+             Language.Japanese => poster.japaneseMaterial,
+             _ => poster.material,
+            };
+           }
+          }
+          EOF_LOC
           cat > "$SCRIPTS/InputManager.cs" << 'EOF'
           using System.Collections;
           using System.Collections.Generic;
@@ -664,6 +761,220 @@ jobs:
           sed -i 's/m_bInitialized = SteamAPI.Init();/m_bInitialized = false;/' "$SCRIPTS/SteamManager.cs"
           grep -q "m_bInitialized = false;" "$SCRIPTS/SteamManager.cs" || { echo "ERROR: Steam patch failed"; exit 1; }
           echo "Patched InputManager, BasicallyRewiredDataStore and SteamManager"
+          cat > patch_map_and_lightmap.py << 'PY_PATCH'
+          import os
+          import re
+          from pathlib import Path
+
+          project_assets = Path("export/ExportedProject/Assets")
+          scripts = project_assets / "Scripts" / "Assembly-CSharp"
+
+          def guid(meta):
+              match = re.search(r"^guid: ([0-9a-f]+)$", Path(meta).read_text(), re.M)
+              if not match:
+                  raise RuntimeError("GUID missing from " + str(meta))
+              return match.group(1)
+
+          def mono_component_id(prefab, script_guid):
+              text = Path(prefab).read_text()
+              for block in re.split(r"(?=^--- !u!)", text, flags=re.M):
+                  if re.search(r"m_Script: \{fileID: 11500000, guid: " + re.escape(script_guid) + r", type: 3\}", block):
+                      match = re.match(r"--- !u!114 &(\d+)", block)
+                      if match:
+                          return match.group(1)
+              raise RuntimeError("component " + script_guid + " not found in " + str(prefab))
+
+          def gameobject_id_by_name(prefab, name):
+              text = Path(prefab).read_text()
+              for block in re.split(r"(?=^--- !u!)", text, flags=re.M):
+                  if re.match(r"--- !u!1 &", block) and re.search(r"^  m_Name: " + re.escape(name) + r"$", block, re.M):
+                      return re.match(r"--- !u!1 &(\d+)", block).group(1)
+              raise RuntimeError("GameObject " + name + " not found in " + str(prefab))
+
+          map_prefab = project_assets / "GameObject" / "Map.prefab"
+          map_guid = guid(scripts / "Map.cs.meta")
+          map_component = mono_component_id(map_prefab, map_guid)
+          fields = {
+              "mapTilePref": (mono_component_id(project_assets / "GameObject" / "MapTile_Prefab.prefab", guid(scripts / "MapTile.cs.meta")), guid(project_assets / "GameObject" / "MapTile_Prefab.prefab.meta")),
+              "mapExtraTilePref": (mono_component_id(project_assets / "GameObject" / "MapExtraTile_Prefab.prefab", guid(scripts / "MapTile.cs.meta")), guid(project_assets / "GameObject" / "MapExtraTile_Prefab.prefab.meta")),
+              "arrowPre": (mono_component_id(project_assets / "GameObject" / "MapIcon.prefab", guid(scripts / "NoLateIcon.cs.meta")), guid(project_assets / "GameObject" / "MapIcon.prefab.meta")),
+          }
+          tiles_object = gameobject_id_by_name(map_prefab, "MapPosition")
+          text = map_prefab.read_text()
+          blocks = re.split(r"(?=^--- !u!)", text, flags=re.M)
+          changed = False
+          component_found = False
+          for i, block in enumerate(blocks):
+              if re.match(r"--- !u!114 &" + re.escape(map_component) + r"\b", block):
+                  component_found = True
+                  additions = []
+                  for field, (file_id, asset_guid) in fields.items():
+                      if not re.search(r"^  " + field + r":", block, re.M):
+                          additions.append("  %s: {fileID: %s, guid: %s, type: 3}" % (field, file_id, asset_guid))
+                  if not re.search(r"^  tilesObject:", block, re.M):
+                      additions.append("  tilesObject: {fileID: %s}" % tiles_object)
+                  if additions:
+                      block = block.rstrip() + "\n" + "\n".join(additions) + "\n"
+                      blocks[i] = block
+                      changed = True
+                  break
+          if not component_found:
+              raise RuntimeError("Map MonoBehaviour block not found in exported prefab")
+          if changed:
+              map_prefab.write_text("".join(blocks))
+              print("Restored Map prefab tile, extra-tile, arrow and tile-parent references")
+          else:
+              print("Map prefab already contains the required references")
+
+          map_cs = scripts / "Map.cs"
+          source = map_cs.read_text()
+          field_marker = "\tprivate EnvironmentController ec;\n"
+          assert source.count(field_marker) == 1, "Map ec field pattern"
+          source = source.replace(field_marker, field_marker + "\tprivate bool androidMapUiAvailable;\n\tpublic bool AndroidMapUiAvailable => androidMapUiAvailable;\n", 1)
+          update_marker = "\tprivate void Update()\n\t{\n"
+          assert source.count(update_marker) == 1, "Map Update pattern"
+          source = source.replace(update_marker, update_marker + "\t\tif (!androidMapUiAvailable || ec == null || clock == null)\n\t\t{\n\t\t\treturn;\n\t\t}\n", 1)
+          old_init = '''\tpublic void Initialize(EnvironmentController ec, IntVector2 size)
+          \t{
+          \t\ttiles = new MapTile[size.x, size.z];
+          \t\tfor (int i = 0; i < size.x; i++)
+          \t\t{
+          \t\t\tfor (int j = 0; j < size.z; j++)
+          \t\t\t{
+          \t\t\t\ttiles[i, j] = Object.Instantiate(mapTilePref, tilesObject.transform);
+          \t\t\t\ttiles[i, j].transform.position = new Vector3(i, j, 0f);
+          \t\t\t}
+          \t\t}
+          \t\tfoundTiles = new bool[size.x, size.z];
+          \t\tthis.size.x = size.x;
+          \t\tthis.size.z = size.z;
+          \t\tthis.ec = ec;
+          \t\tShader.DisableKeyword("_KEYMAPSHOWBACKGROUND");
+          \t}
+          '''
+          new_init = '''\tpublic void Initialize(EnvironmentController ec, IntVector2 size)
+          \t{
+          \t\tthis.ec = ec;
+          \t\tthis.size = size;
+          \t\ttiles = new MapTile[size.x, size.z];
+          \t\tfoundTiles = new bool[size.x, size.z];
+          \t\tif (mapTilePref == null || tilesObject == null)
+          \t\t{
+          \t\t\tDebug.LogError("ANDROID MAP: required map tile references are missing; map UI disabled so level generation can continue.");
+          \t\t\tandroidMapUiAvailable = false;
+          \t\t\treturn;
+          \t\t}
+          \t\tfor (int i = 0; i < size.x; i++)
+          \t\t{
+          \t\t\tfor (int j = 0; j < size.z; j++)
+          \t\t\t{
+          \t\t\t\ttiles[i, j] = Object.Instantiate(mapTilePref, tilesObject.transform);
+          \t\t\t\ttiles[i, j].transform.position = new Vector3(i, j, 0f);
+          \t\t\t}
+          \t\t}
+          \t\tandroidMapUiAvailable = clock != null && padCanvas != null && stickerCanvas != null && bg != null && cover != null && gridObject != null;
+          \t\tif (!androidMapUiAvailable) Debug.LogWarning("ANDROID MAP: map display references are incomplete; keeping gameplay active with the map screen disabled.");
+          \t\tShader.DisableKeyword("_KEYMAPSHOWBACKGROUND");
+          \t}
+          '''
+          assert source.count(old_init) == 1, "Map Initialize pattern"
+          source = source.replace(old_init, new_init, 1)
+          old_add_extra = '''\tpublic MapTile AddExtraTile(IntVector2 position)
+          \t{
+          \t\tMapTile mapTile = Object.Instantiate(mapExtraTilePref, tiles[position.x, position.z].transform);
+          \t\tmapTile.gameObject.SetActive(value: true);
+          \t\treturn mapTile;
+          \t}
+          '''
+          new_add_extra = '''\tpublic MapTile AddExtraTile(IntVector2 position)
+          \t{
+          \t\tif (mapExtraTilePref == null || tiles == null || position.x < 0 || position.z < 0 || position.x >= tiles.GetLength(0) || position.z >= tiles.GetLength(1) || tiles[position.x, position.z] == null)
+          \t\t{
+          \t\t\treturn MapTile.CreateAndroidPlaceholder();
+          \t\t}
+          \t\tMapTile mapTile = Object.Instantiate(mapExtraTilePref, tiles[position.x, position.z].transform);
+          \t\tmapTile.gameObject.SetActive(value: true);
+          \t\treturn mapTile;
+          \t}
+          '''
+          assert source.count(old_add_extra) == 1, "Map AddExtraTile pattern"
+          source = source.replace(old_add_extra, new_add_extra, 1)
+          source = source.replace("\tpublic void AddArrow(Entity target, Color color)\n\t{\n", "\tpublic void AddArrow(Entity target, Color color)\n\t{\n\t\tif (arrowPre == null) return;\n", 1)
+          source = source.replace("\tpublic MapIcon AddIcon(MapIcon iconPre, Transform target, Color color)\n\t{\n", "\tpublic MapIcon AddIcon(MapIcon iconPre, Transform target, Color color)\n\t{\n\t\tif (iconPre == null) return null;\n", 1)
+          core = scripts / "CoreGameManager.cs"
+          core_source = core.read_text()
+          open_marker = "\tpublic void OpenMap(bool toMap)\n\t{\n"
+          assert core_source.count(open_marker) == 1, "CoreGameManager OpenMap pattern"
+          core_source = core_source.replace(open_marker, open_marker + "\t\tif (GetPlayer(0) == null || GetPlayer(0).ec == null || GetPlayer(0).ec.map == null || !GetPlayer(0).ec.map.AndroidMapUiAvailable) return;\n", 1)
+          core.write_text(core_source)
+          map_cs.write_text(source)
+          map_tile_cs = scripts / "MapTile.cs"
+          tile_source = map_tile_cs.read_text()
+          reveal_marker = "\tpublic void Reveal()\n"
+          assert tile_source.count(reveal_marker) == 1, "MapTile Reveal pattern"
+          tile_source = tile_source.replace(reveal_marker, "\tpublic static MapTile CreateAndroidPlaceholder()\n\t{\n\t\tGameObject go = new GameObject(\"AndroidMapPlaceholder\");\n\t\tMapTile tile = go.AddComponent<MapTile>();\n\t\ttile.spriteRenderer = go.AddComponent<SpriteRenderer>();\n\t\tgo.SetActive(false);\n\t\treturn tile;\n\t}\n\n" + reveal_marker, 1)
+          map_tile_cs.write_text(tile_source)
+          print("Patched map startup guards for missing references")
+
+          core = scripts / "CoreGameManager.cs"
+          source = core.read_text()
+          field_marker = "\tpublic Texture2D lightMapTexture;\n"
+          assert source.count(field_marker) == 1, "CoreGameManager light-map field"
+          source = source.replace(field_marker, field_marker + "\tprivate bool androidWritableLightMapCreated;\n", 1)
+          old_lighting = '''\tpublic void UpdateLighting(Color color, IntVector2 pos)
+          \t{
+          \t\tlightMapTexture.SetPixel(pos.x, pos.z, color);
+          \t\tupdateLightMap = true;
+          \t}
+          '''
+          new_lighting = '''\tpublic void UpdateLighting(Color color, IntVector2 pos)
+          \t{
+          \t\tif (lightMapTexture == null) return;
+          \t\tif (!androidWritableLightMapCreated)
+          \t\t{
+          \t\t\tTexture2D source = lightMapTexture;
+          \t\t\tRenderTexture temp = RenderTexture.GetTemporary(source.width, source.height, 0, RenderTextureFormat.ARGB32);
+          \t\t\tRenderTexture previous = RenderTexture.active;
+          \t\t\tTexture2D copy = null;
+          \t\t\ttry
+          \t\t\t{
+          \t\t\t\tGraphics.Blit(source, temp);
+          \t\t\t\tRenderTexture.active = temp;
+          \t\t\t\tcopy = new Texture2D(source.width, source.height, TextureFormat.RGBA32, false);
+          \t\t\t\tcopy.ReadPixels(new Rect(0, 0, source.width, source.height), 0, 0, false);
+          \t\t\t\tcopy.Apply(false, false);
+          \t\t\t\tlightMapTexture = copy;
+          \t\t\t\tforeach (Material material in Resources.FindObjectsOfTypeAll<Material>())
+          \t\t\t\t{
+          \t\t\t\t\tif (material != null && material.HasProperty("_LightMap") && material.GetTexture("_LightMap") == source) material.SetTexture("_LightMap", copy);
+          \t\t\t\t}
+          \t\t\t\tShader.SetGlobalTexture("_LightMap", copy);
+          \t\t\t\tandroidWritableLightMapCreated = true;
+          \t\t\t\tDebug.Log("ANDROID LIGHTMAP: copied to writable RGBA32 texture " + copy.width + "x" + copy.height);
+          \t\t\t}
+          \t\t\tcatch (System.Exception exception)
+          \t\t\t{
+          \t\t\t\tif (copy != null) UnityEngine.Object.Destroy(copy);
+          \t\t\t\tDebug.LogError("ANDROID LIGHTMAP: could not create writable texture: " + exception.Message);
+          \t\t\t\treturn;
+          \t\t\t}
+          \t\t\tfinally
+          \t\t\t{
+          \t\t\t\tRenderTexture.active = previous;
+          \t\t\t\tRenderTexture.ReleaseTemporary(temp);
+          \t\t\t}
+          \t\t}
+          \t\tif (pos.x < 0 || pos.z < 0 || pos.x >= lightMapTexture.width || pos.z >= lightMapTexture.height) return;
+          \t\tlightMapTexture.SetPixel(pos.x, pos.z, color);
+          \t\tupdateLightMap = true;
+          \t}
+          '''
+          assert source.count(old_lighting) == 1, "CoreGameManager UpdateLighting pattern"
+          source = source.replace(old_lighting, new_lighting, 1)
+          core.write_text(source)
+          print("Patched Android light-map texture writes")
+          PY_PATCH
+          python3 patch_map_and_lightmap.py
 
       - name: Patch camera data for Android
         run: |
@@ -1136,6 +1447,7 @@ jobs:
           	{
           		_MainTex ("Texture", 2D) = "white" {}
           		_Color ("Color", Vector) = (1,1,1,0)
+                  _AlphaTex ("External Alpha", 2D) = "white" {}
           		_ColorMultiplier ("ColorMultiplier", Float) = 1
           		[Toggle] BOOLEAN_BILLBOARD ("Billboard", Float) = 0
           %s	}
@@ -1152,11 +1464,14 @@ jobs:
           			#pragma vertex vert
           			#pragma fragment frag
           			#pragma shader_feature_local BOOLEAN_BILLBOARD_ON
+                      #pragma multi_compile _ ETC1_EXTERNAL_ALPHA
 
           %s
           			float3 _WorldSpaceCameraPos;
           			Texture2D _MainTex;
           			SamplerState sampler_MainTex;
+                      Texture2D _AlphaTex;
+                      SamplerState sampler_AlphaTex;
           			float4 _Color;
           			float _ColorMultiplier;
           			float _Cutoff;
@@ -1195,6 +1510,9 @@ jobs:
           			float4 frag(Varyings input) : SV_Target
           			{
           				float4 tex = _MainTex.Sample(sampler_MainTex, input.uv);
+                          #if defined(ETC1_EXTERNAL_ALPHA)
+                          tex.a = _AlphaTex.Sample(sampler_AlphaTex, input.uv).r;
+                          #endif
           				clip(tex.a - _Cutoff);
           				return float4(tex.rgb * _Color.rgb * _ColorMultiplier, 1.0);
           			}
