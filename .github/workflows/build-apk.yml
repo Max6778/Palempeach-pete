@@ -1037,6 +1037,750 @@ jobs:
           BLIT="export/ExportedProject/Assets/Shader/Hidden_Universal Render Pipeline_Blit.shader"
           if [ -f "$BLIT" ]; then cp blit.shader "$BLIT"; echo "Replaced the Blit shader"; else echo "WARNING: Blit shader file not found"; fi
 
+      - name: Replace stand-in shaders with working ones
+        run: |
+          cat > write_shaders.py << 'EOF_PY'
+          import os
+
+          ROOT = "export/ExportedProject/Assets"
+
+          HEAD_DECL = """			float4x4 unity_ObjectToWorld;
+          			float4x4 unity_MatrixVP;
+          """
+
+          BLEND_PROPS = """		_Cutoff ("Cutoff", Float) = 0.5
+          		[HideInInspector] _SrcBlend ("SrcBlend", Float) = 1
+          		[HideInInspector] _DstBlend ("DstBlend", Float) = 0
+          		[HideInInspector] _ZWrite ("ZWrite", Float) = 1
+          """
+
+
+          def standard(name, tiling, color, clip):
+              props = '\t\t_MainTex ("Texture", 2D) = "white" {}\n'
+              decl = "\t\t\tTexture2D _MainTex;\n\t\t\tSamplerState sampler_MainTex;\n\t\t\tfloat _Cutoff;\n\t\t\tfloat _SrcBlend;\n"
+              uv = "input.uv"
+              if tiling:
+                  props += '\t\t_TextureOffset ("TextureOffset", Vector) = (0,0,0,0)\n\t\t_Tiling ("Tiling", Vector) = (1,1,0,0)\n'
+                  decl += "\t\t\tfloat4 _TextureOffset;\n\t\t\tfloat4 _Tiling;\n"
+                  uv = "input.uv * _Tiling.xy + _TextureOffset.xy"
+              rgb = "tex.rgb"
+              if color:
+                  props += '\t\t_TextureColor ("Color", Vector) = (1,1,1,0)\n\t\t_ColorMultiplier ("ColorMultiplier", Float) = 1\n'
+                  decl += "\t\t\tfloat4 _TextureColor;\n\t\t\tfloat _ColorMultiplier;\n"
+                  rgb = "tex.rgb * _TextureColor.rgb * _ColorMultiplier"
+              pragma = ""
+              clip_code = ""
+              if clip == "keyword":
+                  pragma = "#pragma shader_feature_local _ALPHATEST_ON"
+                  clip_code = "#if defined(_ALPHATEST_ON)\n\t\t\t\tclip(tex.a - _Cutoff);\n\t\t\t#endif"
+              elif clip == "always":
+                  clip_code = "clip(tex.a - _Cutoff);"
+              return """Shader "%s"
+          {
+          	Properties
+          	{
+          %s%s	}
+          	SubShader
+          	{
+          		Tags { "RenderType" = "Opaque" }
+          		LOD 100
+          		Pass
+          		{
+          			Cull Off
+          			Blend [_SrcBlend] [_DstBlend]
+          			ZWrite [_ZWrite]
+          			HLSLPROGRAM
+          			#pragma vertex vert
+          			#pragma fragment frag
+          			%s
+
+          %s%s
+          			struct Attributes
+          			{
+          				float4 pos : POSITION;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			struct Varyings
+          			{
+          				float4 pos : SV_POSITION;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			Varyings vert(Attributes input)
+          			{
+          				Varyings output;
+          				output.pos = mul(unity_MatrixVP, mul(unity_ObjectToWorld, input.pos));
+          				output.uv = %s;
+          				return output;
+          			}
+
+          			float4 frag(Varyings input) : SV_Target
+          			{
+          				float4 tex = _MainTex.Sample(sampler_MainTex, input.uv);
+          				%s
+          				float alpha = (_SrcBlend > 1.5) ? tex.a : 1.0;
+          				return float4(%s, alpha);
+          			}
+          			ENDHLSL
+          		}
+          	}
+          }
+          """ % (name, props, BLEND_PROPS, pragma, HEAD_DECL, decl, uv, clip_code, rgb)
+
+
+          def sprite(name):
+              return """Shader "%s"
+          {
+          	Properties
+          	{
+          		_MainTex ("Texture", 2D) = "white" {}
+          		_Color ("Color", Vector) = (1,1,1,0)
+          		_ColorMultiplier ("ColorMultiplier", Float) = 1
+          		[Toggle] BOOLEAN_BILLBOARD ("Billboard", Float) = 0
+          %s	}
+          	SubShader
+          	{
+          		Tags { "RenderType" = "Opaque" }
+          		LOD 100
+          		Pass
+          		{
+          			Cull Off
+          			Blend [_SrcBlend] [_DstBlend]
+          			ZWrite [_ZWrite]
+          			HLSLPROGRAM
+          			#pragma vertex vert
+          			#pragma fragment frag
+          			#pragma shader_feature_local BOOLEAN_BILLBOARD_ON
+
+          %s
+          			float3 _WorldSpaceCameraPos;
+          			Texture2D _MainTex;
+          			SamplerState sampler_MainTex;
+          			float4 _Color;
+          			float _ColorMultiplier;
+          			float _Cutoff;
+
+          			struct Attributes
+          			{
+          				float4 pos : POSITION;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			struct Varyings
+          			{
+          				float4 pos : SV_POSITION;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			Varyings vert(Attributes input)
+          			{
+          				Varyings output;
+          			#if defined(BOOLEAN_BILLBOARD_ON)
+          				float3 center = float3(unity_ObjectToWorld[0][3], unity_ObjectToWorld[1][3], unity_ObjectToWorld[2][3]);
+          				float sx = length(float3(unity_ObjectToWorld[0][0], unity_ObjectToWorld[1][0], unity_ObjectToWorld[2][0]));
+          				float sy = length(float3(unity_ObjectToWorld[0][1], unity_ObjectToWorld[1][1], unity_ObjectToWorld[2][1]));
+          				float3 toCam = float3(_WorldSpaceCameraPos.x - center.x, 0.0, _WorldSpaceCameraPos.z - center.z);
+          				toCam = normalize(toCam + float3(0.0, 0.0, 0.0001));
+          				float3 rightDir = normalize(cross(float3(0.0, 1.0, 0.0), toCam));
+          				float3 worldPos = center + rightDir * (input.pos.x * sx) + float3(0.0, 1.0, 0.0) * (input.pos.y * sy);
+          				output.pos = mul(unity_MatrixVP, float4(worldPos, 1.0));
+          			#else
+          				output.pos = mul(unity_MatrixVP, mul(unity_ObjectToWorld, input.pos));
+          			#endif
+          				output.uv = input.uv;
+          				return output;
+          			}
+
+          			float4 frag(Varyings input) : SV_Target
+          			{
+          				float4 tex = _MainTex.Sample(sampler_MainTex, input.uv);
+          				clip(tex.a - _Cutoff);
+          				return float4(tex.rgb * _Color.rgb * _ColorMultiplier, 1.0);
+          			}
+          			ENDHLSL
+          		}
+          	}
+          }
+          """ % (name, BLEND_PROPS, HEAD_DECL + "\t\t\tfloat _SrcBlend;\n")
+
+
+          def masked_standard():
+              return """Shader "Shader Graphs/MaskedStandard"
+          {
+          	Properties
+          	{
+          		_TextureColor ("Color", Vector) = (1,1,1,0)
+          		_Mask ("Mask", 2D) = "white" {}
+          %s	}
+          	SubShader
+          	{
+          		Tags { "RenderType" = "Opaque" }
+          		LOD 100
+          		Pass
+          		{
+          			Cull Off
+          			Blend [_SrcBlend] [_DstBlend]
+          			ZWrite [_ZWrite]
+          			HLSLPROGRAM
+          			#pragma vertex vert
+          			#pragma fragment frag
+
+          %s
+          			Texture2D _Mask;
+          			SamplerState sampler_Mask;
+          			float4 _TextureColor;
+          			float _Cutoff;
+
+          			struct Attributes
+          			{
+          				float4 pos : POSITION;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			struct Varyings
+          			{
+          				float4 pos : SV_POSITION;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			Varyings vert(Attributes input)
+          			{
+          				Varyings output;
+          				output.pos = mul(unity_MatrixVP, mul(unity_ObjectToWorld, input.pos));
+          				output.uv = input.uv;
+          				return output;
+          			}
+
+          			float4 frag(Varyings input) : SV_Target
+          			{
+          				float4 m = _Mask.Sample(sampler_Mask, input.uv);
+          				clip(m.a - _Cutoff);
+          				return float4(_TextureColor.rgb * m.rgb, 1.0);
+          			}
+          			ENDHLSL
+          		}
+          	}
+          }
+          """ % (BLEND_PROPS, HEAD_DECL)
+
+
+          def depth_mask():
+              return """Shader "Masked/Mask"
+          {
+          	Properties
+          	{
+          	}
+          	SubShader
+          	{
+          		Tags { "RenderType" = "Opaque" "Queue" = "Geometry-10" }
+          		Pass
+          		{
+          			ColorMask 0
+          			ZWrite On
+          			HLSLPROGRAM
+          			#pragma vertex vert
+          			#pragma fragment frag
+
+          %s
+          			struct Attributes
+          			{
+          				float4 pos : POSITION;
+          			};
+
+          			struct Varyings
+          			{
+          				float4 pos : SV_POSITION;
+          			};
+
+          			Varyings vert(Attributes input)
+          			{
+          				Varyings output;
+          				output.pos = mul(unity_MatrixVP, mul(unity_ObjectToWorld, input.pos));
+          				return output;
+          			}
+
+          			float4 frag(Varyings input) : SV_Target
+          			{
+          				return float4(0.0, 0.0, 0.0, 0.0);
+          			}
+          			ENDHLSL
+          		}
+          	}
+          }
+          """ % HEAD_DECL
+
+
+          def map_tile():
+              return """Shader "Shader Graphs/MapTile"
+          {
+          	Properties
+          	{
+          		_MapBackground ("MapBackground", 2D) = "white" {}
+          		_Color ("Color", Vector) = (1,1,1,0)
+          %s	}
+          	SubShader
+          	{
+          		Tags { "RenderType" = "Transparent" "Queue" = "Transparent" }
+          		LOD 100
+          		Pass
+          		{
+          			Cull Off
+          			ZWrite Off
+          			Blend SrcAlpha OneMinusSrcAlpha
+          			HLSLPROGRAM
+          			#pragma vertex vert
+          			#pragma fragment frag
+          			#pragma shader_feature_local _KEYMAPSHOWBACKGROUND_ON
+
+          %s
+          			Texture2D _MapBackground;
+          			SamplerState sampler_MapBackground;
+          			float4 _Color;
+
+          			struct Attributes
+          			{
+          				float4 pos : POSITION;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			struct Varyings
+          			{
+          				float4 pos : SV_POSITION;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			Varyings vert(Attributes input)
+          			{
+          				Varyings output;
+          				output.pos = mul(unity_MatrixVP, mul(unity_ObjectToWorld, input.pos));
+          				output.uv = input.uv;
+          				return output;
+          			}
+
+          			float4 frag(Varyings input) : SV_Target
+          			{
+          				float4 c = float4(_Color.rgb, 1.0);
+          			#if defined(_KEYMAPSHOWBACKGROUND_ON)
+          				float4 bg = _MapBackground.Sample(sampler_MapBackground, input.uv);
+          				c.rgb = lerp(bg.rgb, c.rgb, saturate(_Color.a));
+          			#endif
+          				return c;
+          			}
+          			ENDHLSL
+          		}
+          	}
+          }
+          """ % (BLEND_PROPS, HEAD_DECL)
+
+
+          def particle():
+              return """Shader "Shader Graphs/Particle"
+          {
+          	Properties
+          	{
+          		_MainTex ("MainTexture", 2D) = "white" {}
+          %s	}
+          	SubShader
+          	{
+          		Tags { "RenderType" = "Opaque" }
+          		LOD 100
+          		Pass
+          		{
+          			Cull Off
+          			Blend [_SrcBlend] [_DstBlend]
+          			ZWrite [_ZWrite]
+          			HLSLPROGRAM
+          			#pragma vertex vert
+          			#pragma fragment frag
+
+          %s
+          			Texture2D _MainTex;
+          			SamplerState sampler_MainTex;
+          			float _Cutoff;
+
+          			struct Attributes
+          			{
+          				float4 pos : POSITION;
+          				float4 color : COLOR;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			struct Varyings
+          			{
+          				float4 pos : SV_POSITION;
+          				float4 color : COLOR;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			Varyings vert(Attributes input)
+          			{
+          				Varyings output;
+          				output.pos = mul(unity_MatrixVP, mul(unity_ObjectToWorld, input.pos));
+          				output.color = input.color;
+          				output.uv = input.uv;
+          				return output;
+          			}
+
+          			float4 frag(Varyings input) : SV_Target
+          			{
+          				float4 tex = _MainTex.Sample(sampler_MainTex, input.uv);
+          				clip(tex.a * input.color.a - _Cutoff);
+          				return float4(tex.rgb * input.color.rgb, 1.0);
+          			}
+          			ENDHLSL
+          		}
+          	}
+          }
+          """ % (BLEND_PROPS, HEAD_DECL)
+
+
+          def polygon():
+              return """Shader "Shader Graphs/Polygon"
+          {
+          	Properties
+          	{
+          	}
+          	SubShader
+          	{
+          		Tags { "RenderType" = "Opaque" }
+          		LOD 100
+          		Pass
+          		{
+          			Cull Off
+          			HLSLPROGRAM
+          			#pragma vertex vert
+          			#pragma fragment frag
+
+          %s
+          			struct Attributes
+          			{
+          				float4 pos : POSITION;
+          			};
+
+          			struct Varyings
+          			{
+          				float4 pos : SV_POSITION;
+          			};
+
+          			Varyings vert(Attributes input)
+          			{
+          				Varyings output;
+          				output.pos = mul(unity_MatrixVP, mul(unity_ObjectToWorld, input.pos));
+          				return output;
+          			}
+
+          			float4 frag(Varyings input) : SV_Target
+          			{
+          				return float4(1.0, 1.0, 1.0, 1.0);
+          			}
+          			ENDHLSL
+          		}
+          	}
+          }
+          """ % HEAD_DECL
+
+
+          STENCIL_PROPS = """		_StencilComp ("Stencil Comparison", Float) = 8
+          		_Stencil ("Stencil ID", Float) = 0
+          		_StencilOp ("Stencil Operation", Float) = 0
+          		_StencilWriteMask ("Stencil Write Mask", Float) = 255
+          		_StencilReadMask ("Stencil Read Mask", Float) = 255
+          		_ColorMask ("Color Mask", Float) = 15
+          """
+
+          TMP_STATE = """		Tags { "Queue" = "Transparent" "IgnoreProjector" = "True" "RenderType" = "Transparent" }
+          		Stencil
+          		{
+          			Ref [_Stencil]
+          			Comp [_StencilComp]
+          			Pass [_StencilOp]
+          			ReadMask [_StencilReadMask]
+          			WriteMask [_StencilWriteMask]
+          		}
+          		Cull Off
+          		ZTest [unity_GUIZTestMode]
+          		ZWrite Off
+          		ColorMask [_ColorMask]
+          """
+
+
+          def tmp_bitmap():
+              return """Shader "TextMeshPro/Bitmap"
+          {
+          	Properties
+          	{
+          		_MainTex ("Font Atlas", 2D) = "white" {}
+          		_FaceTex ("Font Texture", 2D) = "white" {}
+          		_FaceColor ("Text Color", Vector) = (1,1,1,1)
+          %s	}
+          	SubShader
+          	{
+          %s		Pass
+          		{
+          			Blend SrcAlpha OneMinusSrcAlpha
+          			HLSLPROGRAM
+          			#pragma vertex vert
+          			#pragma fragment frag
+
+          %s
+          			Texture2D _MainTex;
+          			SamplerState sampler_MainTex;
+          			float4 _FaceColor;
+
+          			struct Attributes
+          			{
+          				float4 pos : POSITION;
+          				float4 color : COLOR;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			struct Varyings
+          			{
+          				float4 pos : SV_POSITION;
+          				float4 color : COLOR;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			Varyings vert(Attributes input)
+          			{
+          				Varyings output;
+          				output.pos = mul(unity_MatrixVP, mul(unity_ObjectToWorld, input.pos));
+          				output.color = input.color * _FaceColor;
+          				output.uv = input.uv;
+          				return output;
+          			}
+
+          			float4 frag(Varyings input) : SV_Target
+          			{
+          				float4 c = input.color;
+          				c.a = c.a * _MainTex.Sample(sampler_MainTex, input.uv).a;
+          				return c;
+          			}
+          			ENDHLSL
+          		}
+          	}
+          }
+          """ % (STENCIL_PROPS, TMP_STATE, HEAD_DECL)
+
+
+          def tmp_sprite():
+              return """Shader "TextMeshPro/Sprite"
+          {
+          	Properties
+          	{
+          		_MainTex ("Sprite Texture", 2D) = "white" {}
+          		_Color ("Tint", Vector) = (1,1,1,1)
+          %s	}
+          	SubShader
+          	{
+          %s		Pass
+          		{
+          			Blend SrcAlpha OneMinusSrcAlpha
+          			HLSLPROGRAM
+          			#pragma vertex vert
+          			#pragma fragment frag
+
+          %s
+          			Texture2D _MainTex;
+          			SamplerState sampler_MainTex;
+          			float4 _Color;
+
+          			struct Attributes
+          			{
+          				float4 pos : POSITION;
+          				float4 color : COLOR;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			struct Varyings
+          			{
+          				float4 pos : SV_POSITION;
+          				float4 color : COLOR;
+          				float2 uv : TEXCOORD0;
+          			};
+
+          			Varyings vert(Attributes input)
+          			{
+          				Varyings output;
+          				output.pos = mul(unity_MatrixVP, mul(unity_ObjectToWorld, input.pos));
+          				output.color = input.color * _Color;
+          				output.uv = input.uv;
+          				return output;
+          			}
+
+          			float4 frag(Varyings input) : SV_Target
+          			{
+          				return _MainTex.Sample(sampler_MainTex, input.uv) * input.color;
+          			}
+          			ENDHLSL
+          		}
+          	}
+          }
+          """ % (STENCIL_PROPS, TMP_STATE, HEAD_DECL)
+
+
+          def tmp_sdf_mobile():
+              return """Shader "TextMeshPro/Mobile/Distance Field"
+          {
+          	Properties
+          	{
+          		_FaceColor ("Face Color", Vector) = (1,1,1,1)
+          		_FaceDilate ("Face Dilate", Range(-1, 1)) = 0
+          		_OutlineColor ("Outline Color", Vector) = (0,0,0,1)
+          		_OutlineWidth ("Outline Thickness", Range(0, 1)) = 0
+          		_OutlineSoftness ("Outline Softness", Range(0, 1)) = 0
+          		_UnderlayColor ("Border Color", Vector) = (0,0,0,0.5)
+          		_UnderlayOffsetX ("Border OffsetX", Range(-1, 1)) = 0
+          		_UnderlayOffsetY ("Border OffsetY", Range(-1, 1)) = 0
+          		_UnderlayDilate ("Border Dilate", Range(-1, 1)) = 0
+          		_UnderlaySoftness ("Border Softness", Range(0, 1)) = 0
+          		_WeightNormal ("Weight Normal", Float) = 0
+          		_WeightBold ("Weight Bold", Float) = 0.5
+          		_ScaleRatioA ("Scale RatioA", Float) = 1
+          		_ScaleRatioB ("Scale RatioB", Float) = 1
+          		_ScaleRatioC ("Scale RatioC", Float) = 1
+          		_MainTex ("Font Atlas", 2D) = "white" {}
+          		_TextureWidth ("Texture Width", Float) = 512
+          		_TextureHeight ("Texture Height", Float) = 512
+          		_GradientScale ("Gradient Scale", Float) = 5
+          		_VertexOffsetX ("Vertex OffsetX", Float) = 0
+          		_VertexOffsetY ("Vertex OffsetY", Float) = 0
+          %s	}
+          	SubShader
+          	{
+          %s		Pass
+          		{
+          			Blend One OneMinusSrcAlpha
+          			HLSLPROGRAM
+          			#pragma vertex vert
+          			#pragma fragment frag
+          			#pragma shader_feature_local OUTLINE_ON
+          			#pragma shader_feature_local UNDERLAY_ON
+
+          %s
+          			Texture2D _MainTex;
+          			SamplerState sampler_MainTex;
+          			float4 _FaceColor;
+          			float _FaceDilate;
+          			float4 _OutlineColor;
+          			float _OutlineWidth;
+          			float4 _UnderlayColor;
+          			float _UnderlayOffsetX;
+          			float _UnderlayOffsetY;
+          			float _UnderlayDilate;
+          			float _WeightNormal;
+          			float _WeightBold;
+          			float _ScaleRatioA;
+          			float _ScaleRatioC;
+          			float _TextureWidth;
+          			float _TextureHeight;
+          			float _GradientScale;
+          			float _VertexOffsetX;
+          			float _VertexOffsetY;
+
+          			struct Attributes
+          			{
+          				float4 pos : POSITION;
+          				float4 color : COLOR;
+          				float2 uv : TEXCOORD0;
+          				float2 uv1 : TEXCOORD1;
+          			};
+
+          			struct Varyings
+          			{
+          				float4 pos : SV_POSITION;
+          				float4 color : COLOR;
+          				float2 uv : TEXCOORD0;
+          				float bold : TEXCOORD1;
+          			};
+
+          			Varyings vert(Attributes input)
+          			{
+          				Varyings output;
+          				float4 p = input.pos;
+          				p.x += _VertexOffsetX;
+          				p.y += _VertexOffsetY;
+          				output.pos = mul(unity_MatrixVP, mul(unity_ObjectToWorld, p));
+          				output.color = input.color * _FaceColor;
+          				output.uv = input.uv;
+          				output.bold = step(input.uv1.y, 0.0);
+          				return output;
+          			}
+
+          			float4 frag(Varyings input) : SV_Target
+          			{
+          				float a = _MainTex.Sample(sampler_MainTex, input.uv).a;
+          				float w = max(fwidth(a), 0.0001);
+          				float weight = (lerp(_WeightNormal, _WeightBold, input.bold) / 4.0 + _FaceDilate) * _ScaleRatioA * 0.5;
+          				float threshold = 0.5 - weight;
+          				float face = saturate((a - threshold) / w + 0.5);
+          				float4 faceColor = input.color;
+          				float4 c = float4(faceColor.rgb, faceColor.a * face);
+          			#if defined(OUTLINE_ON)
+          				float ow = _OutlineWidth * _ScaleRatioA * 0.5;
+          				float outer = saturate((a - (threshold - ow)) / w + 0.5);
+          				c.rgb = lerp(_OutlineColor.rgb, faceColor.rgb, face);
+          				c.a = lerp(_OutlineColor.a, faceColor.a, face) * outer;
+          			#endif
+          				float4 result = float4(c.rgb * c.a, c.a);
+          			#if defined(UNDERLAY_ON)
+          				float2 off = float2(_UnderlayOffsetX, _UnderlayOffsetY) * _GradientScale / float2(max(_TextureWidth, 1.0), max(_TextureHeight, 1.0));
+          				float a2 = _MainTex.Sample(sampler_MainTex, input.uv - off).a;
+          				float w2 = max(fwidth(a2), 0.0001);
+          				float shadow = saturate((a2 - (0.5 - _UnderlayDilate * _ScaleRatioC * 0.5)) / w2 + 0.5);
+          				float sa = _UnderlayColor.a * shadow;
+          				float4 under = float4(_UnderlayColor.rgb * sa, sa);
+          				result = result + under * (1.0 - result.a);
+          			#endif
+          				return result;
+          			}
+          			ENDHLSL
+          		}
+          	}
+          }
+          """ % (STENCIL_PROPS, TMP_STATE, HEAD_DECL)
+
+
+          SHADERS = {
+              "Shader/Shader Graphs_Standard.shader": standard("Shader Graphs/Standard", True, True, "keyword"),
+              "Shader/Shader Graphs_TileStandard.shader": standard("Shader Graphs/TileStandard", False, False, "none"),
+              "Shader/Shader Graphs_TileStandard_AlphaClip.shader": standard("Shader Graphs/TileStandard_AlphaClip", False, False, "always"),
+              "Shader/Shader Graphs_TileStandardWPoster.shader": standard("Shader Graphs/TileStandardWPoster", False, False, "none"),
+              "Shader/Shader Graphs_TileStandardWPoster_AlphaClip.shader": standard("Shader Graphs/TileStandardWPoster_AlphaClip", False, False, "always"),
+              "Shader/Shader Graphs_SpriteStandard.shader": sprite("Shader Graphs/SpriteStandard"),
+              "Shader/SpriteStandard_NoBatching.shader": sprite("SpriteStandard_NoBatching"),
+              "Shader/Shader Graphs_MaskedStandard.shader": masked_standard(),
+              "Shader/Masked_Mask.shader": depth_mask(),
+              "Shader/Shader Graphs_MapTile.shader": map_tile(),
+              "Shader/Shader Graphs_Particle.shader": particle(),
+              "Shader/Shader Graphs_Polygon.shader": polygon(),
+              "Shader/Shader Graphs_Skybox.shader": standard("Shader Graphs/Skybox", True, True, "none"),
+              "Resources/shaders/tmp_bitmap.shader": tmp_bitmap(),
+              "Resources/shaders/tmp_sprite.shader": tmp_sprite(),
+              "Resources/shaders/tmp_sdf-mobile.shader": tmp_sdf_mobile(),
+          }
+
+          done = 0
+          for rel, text in SHADERS.items():
+              path = os.path.join(ROOT, rel)
+              if not os.path.isfile(path):
+                  # fall back to searching by file name
+                  found = None
+                  for dp, dn, fn in os.walk(ROOT):
+                      if os.path.basename(rel) in fn:
+                          found = os.path.join(dp, os.path.basename(rel))
+                          break
+                  if found is None:
+                      print("WARNING: not found:", rel)
+                      continue
+                  path = found
+              open(path, "w").write(text)
+              done += 1
+          print("Replaced %d of %d shaders" % (done, len(SHADERS)))
+          EOF_PY
+          python3 write_shaders.py
+
       - name: Add build script
         run: |
           mkdir -p export/ExportedProject/Assets/Editor
@@ -1109,7 +1853,7 @@ jobs:
       - name: Show Unity errors
         if: always()
         run: |
-          grep -E "error CS|CIBuild:|Build Finished|Error building|BuildFailed|Gradle build failed" unity.log | sort -u | head -n 60 || true
+          grep -E "error CS|Shader error|CIBuild:|Build Finished|Error building|BuildFailed|Gradle build failed" unity.log | sort -u | head -n 60 || true
           tail -n 30 unity.log || true
 
       - name: Publish APK and log to a release
