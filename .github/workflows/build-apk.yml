@@ -449,7 +449,7 @@ jobs:
           			{
           				text2 = camera.targetTexture.width + "x" + camera.targetTexture.height + " " + camera.targetTexture.format;
           			}
-          			Debug.Log("DIAG cam " + camera.name + " depth=" + camera.depth + " mask=" + camera.cullingMask + " target=" + text2);
+          			Debug.Log("DIAG cam " + camera.name + " depth=" + camera.depth + " mask=" + camera.cullingMask + " target=" + text2 + " rect=" + camera.rect + " pix=" + camera.pixelRect + " clear=" + camera.clearFlags + " bg=" + camera.backgroundColor + " fov=" + camera.fieldOfView + " ortho=" + camera.orthographic);
           		}
           	}
 
@@ -1139,6 +1139,204 @@ jobs:
           patch("CoreGameManager.cs", patch_core)
           EOF
           python3 patch_cameras.py
+
+      - name: Repair Map component for Android
+        run: |
+          cat > patch_map.py << 'EOF_MAP'
+          import os, shutil, subprocess
+
+          ROOT = "export/ExportedProject/Assets"
+          d = subprocess.run("find %s -type d -name Assembly-CSharp | head -n 1" % ROOT, shell=True, capture_output=True, text=True).stdout.strip()
+          if os.environ.get("SCRIPTS_DIR"):
+              d = os.environ["SCRIPTS_DIR"]
+          print("Scripts folder:", d)
+
+          METHOD = '''	private bool referencesFixed;
+
+          	private Transform FindPart(string partName, bool isUi)
+          	{
+          		Transform[] componentsInChildren = GetComponentsInChildren<Transform>(true);
+          		for (int i = 0; i < componentsInChildren.Length; i++)
+          		{
+          			if (componentsInChildren[i].name == partName && (componentsInChildren[i] is RectTransform) == isUi)
+          			{
+          				return componentsInChildren[i];
+          			}
+          		}
+          		return null;
+          	}
+
+          	private void FixReferences()
+          	{
+          		if (referencesFixed)
+          		{
+          			return;
+          		}
+          		referencesFixed = true;
+          		if (mapTilePref == null)
+          		{
+          			mapTilePref = Resources.Load<MapTile>("MapTile_Prefab");
+          		}
+          		if (mapExtraTilePref == null)
+          		{
+          			mapExtraTilePref = Resources.Load<MapTile>("MapExtraTile_Prefab");
+          		}
+          		if (arrowPre == null)
+          		{
+          			arrowPre = Resources.Load<MapIcon>("Icon_Arrow");
+          		}
+          		Transform part;
+          		if (tilesObject == null)
+          		{
+          			part = FindPart("Tiles", false);
+          			if (part != null)
+          			{
+          				tilesObject = part.gameObject;
+          			}
+          		}
+          		if (markersObject == null)
+          		{
+          			part = FindPart("Markers", false);
+          			if (part != null)
+          			{
+          				markersObject = part.gameObject;
+          			}
+          		}
+          		if (bg == null)
+          		{
+          			part = FindPart("BG", false);
+          			if (part != null)
+          			{
+          				bg = part.gameObject;
+          			}
+          		}
+          		if (gridObject == null)
+          		{
+          			part = FindPart("Grid", false);
+          			if (part != null)
+          			{
+          				gridObject = part.gameObject;
+          			}
+          		}
+          		if (markerIndicator == null)
+          		{
+          			part = FindPart("MarkerModeIndicator", true);
+          			if (part != null)
+          			{
+          				markerIndicator = part.gameObject;
+          			}
+          		}
+          		if (fullIndicator == null)
+          		{
+          			part = FindPart("MarkersFullIndicator", true);
+          			if (part != null)
+          			{
+          				fullIndicator = part.gameObject;
+          			}
+          		}
+          		if (cover == null)
+          		{
+          			part = FindPart("Cover", true);
+          			if (part != null)
+          			{
+          				cover = part.gameObject;
+          			}
+          		}
+          		if (backToMapButton == null)
+          		{
+          			part = FindPart("MapButton", true);
+          			if (part != null)
+          			{
+          				backToMapButton = part.gameObject;
+          			}
+          		}
+          		if (padCanvas == null)
+          		{
+          			part = FindPart("Overlay", true);
+          			if (part != null)
+          			{
+          				padCanvas = part.GetComponent<Canvas>();
+          			}
+          		}
+          		if (stickerCanvas == null)
+          		{
+          			part = FindPart("BackOverlay", true);
+          			if (part != null)
+          			{
+          				stickerCanvas = part.GetComponent<Canvas>();
+          			}
+          		}
+          		if (markerCursor == null)
+          		{
+          			part = FindPart("MarkerCursor", false);
+          			if (part != null)
+          			{
+          				markerCursor = part.GetComponent<SpriteRenderer>();
+          			}
+          		}
+          		if (clock == null)
+          		{
+          			part = FindPart("Timer", true);
+          			if (part != null)
+          			{
+          				clock = part.GetComponent<DigitalClock>();
+          			}
+          		}
+          		if (markerPre == null || markerPre.Length == 0)
+          		{
+          			string[] array = new string[9] { "Marker_0", "Marker_1", "Marker_2", "Marker_3", "Marker_4", "Marker_5", "PinMarker_0", "PinMarker_1", "PinMarker_2" };
+          			MapMarker[] array2 = new MapMarker[array.Length];
+          			bool flag = true;
+          			for (int j = 0; j < array.Length; j++)
+          			{
+          				array2[j] = Resources.Load<MapMarker>(array[j]);
+          				if (array2[j] == null)
+          				{
+          					flag = false;
+          				}
+          			}
+          			if (flag)
+          			{
+          				markerPre = array2;
+          			}
+          		}
+          		Debug.Log("MAPFIX: tilePref=" + (mapTilePref != null) + " extra=" + (mapExtraTilePref != null) + " arrow=" + (arrowPre != null) + " tiles=" + (tilesObject != null) + " markers=" + (markersObject != null) + " clock=" + (clock != null) + " pad=" + (padCanvas != null) + " sticker=" + (stickerCanvas != null));
+          	}
+
+          '''
+
+          p = os.path.join(d, "Map.cs")
+          s = open(p, newline="").read().replace("\r\n", "\n")
+          old = "\tprivate void Awake()\n\t{\n"
+          assert s.count(old) == 1, "Map Awake pattern"
+          s = s.replace(old, old + "\t\tFixReferences();\n")
+          marker = "\tpublic void Initialize(EnvironmentController ec, IntVector2 size)\n\t{\n"
+          assert s.count(marker) == 1, "Map Initialize pattern"
+          s = s.replace(marker, METHOD + marker + "\t\tFixReferences();\n")
+          open(p, "w", newline="").write(s)
+          print("patched Map.cs")
+
+          # move the prefabs that only the Map used into Resources so they are included in the build
+          res = os.path.join(ROOT, "Resources")
+          os.makedirs(res, exist_ok=True)
+          names = ["MapTile_Prefab", "MapExtraTile_Prefab", "Icon_Arrow", "Marker_0", "Marker_1", "Marker_2", "Marker_3", "Marker_4", "Marker_5", "PinMarker_0", "PinMarker_1", "PinMarker_2"]
+          moved = 0
+          for name in names:
+              src = None
+              for dp, dn, fn in os.walk(ROOT):
+                  if name + ".prefab" in fn and os.path.abspath(dp) != os.path.abspath(res):
+                      src = os.path.join(dp, name + ".prefab")
+                      break
+              if src is None:
+                  print("WARNING: prefab not found:", name)
+                  continue
+              for ext in ("", ".meta"):
+                  if os.path.exists(src + ext):
+                      shutil.move(src + ext, os.path.join(res, name + ".prefab" + ext))
+              moved += 1
+          print("moved %d prefabs into Resources" % moved)
+          EOF_MAP
+          python3 patch_map.py
 
       - name: Patch URP renderer for Android
         run: |
