@@ -1,0 +1,129 @@
+name: Compare renderer assets (PC vs Android APK)
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/swift /opt/hostedtoolcache/CodeQL
+      - name: Download both versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p inputs/windows inputs/android
+          gh release download game1 --repo "$GITHUB_REPOSITORY" -p "Game.zip" -O inputs/Game.zip
+          unzip -q inputs/Game.zip -d inputs/windows
+          gh release download big-samples --repo "$GITHUB_REPOSITORY" -p "41be1814_Baldis_Basics_Plus_V0.14.3_Android_Port.apk" -D inputs/android
+      - name: Download AssetRipper
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir ar_dl ar
+          gh release download --repo AssetRipper/AssetRipper -p "*linux_x64*" -D ar_dl
+          for f in ar_dl/*; do
+            case "$f" in
+              *.zip) unzip -q "$f" -d ar ;;
+              *.tar.gz|*.tgz) tar -xzf "$f" -C ar ;;
+              *.tar.xz) tar -xJf "$f" -C ar ;;
+              *.tar) tar -xf "$f" -C ar ;;
+            esac
+          done
+          EXE=$(find ar -name AssetRipper.GUI.Free -type f -print -quit)
+          test -n "$EXE"
+          chmod +x "$EXE"
+          echo "EXE=$PWD/$EXE" >> "$GITHUB_ENV"
+      - name: Export APK and PC game
+        run: |
+          set -euo pipefail
+          export ASPNETCORE_URLS=http://127.0.0.1:5000
+          rip() {
+            label="$1"; source="$2"; endpoint="$3"; out="$PWD/export/$1"
+            mkdir -p "$out"
+            "$EXE" --headless --port 5000 --log-path "$PWD/$label-ar.log" > "$label-ar-stdout.log" 2>&1 &
+            pid=$!
+            for i in $(seq 1 60); do curl -fsS http://127.0.0.1:5000 >/dev/null && break || sleep 2; done
+            curl -fsS -o /dev/null --max-time 60 -X POST --data-urlencode "ScriptExportMode=Hybrid" --data-urlencode "ShaderExportMode=Decompile" http://127.0.0.1:5000/Settings/Update
+            curl -fsS -o "$label-load.txt" --max-time 900 -X POST --data-urlencode "Path=$source" "http://127.0.0.1:5000/$endpoint"
+            curl -fsS -o "$label-export.txt" --max-time 1800 -X POST --data-urlencode "Path=$out" http://127.0.0.1:5000/Export/UnityProject
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            test -d "$out/ExportedProject/Assets" || { tail -n 100 "$label-ar.log"; return 1; }
+          }
+          DATA=$(find inputs/windows -name globalgamemanagers -print -quit)
+          APK="$PWD/inputs/android/41be1814_Baldis_Basics_Plus_V0.14.3_Android_Port.apk"
+          rip android "$APK" LoadFile
+          rip windows "$PWD/$(dirname "$DATA")/.." LoadFolder
+      - name: Create comparison report and compact source archive
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, tarfile
+          base=Path("export"); reports=[]; names={}
+          stage=Path("renderer-assets")
+          for label in ("android","windows"):
+              root=base/label/"ExportedProject"; assets=root/"Assets"
+              guids={}
+              for m in assets.rglob("*.meta"):
+                  q=re.search(r"^guid:\s*([0-9a-f]{32})",m.read_text(errors="ignore"),re.M)
+                  if q: guids[q.group(1)]=str(m)[:-5]
+              shaders={}
+              for p in list(assets.rglob("*.shader"))+list(assets.rglob("*.shadergraph")):
+                  t=p.read_text(errors="ignore"); q=re.search(r'^\s*Shader\s+"([^"]+)"',t,re.M)
+                  n=q.group(1) if q else p.name; shaders.setdefault(n,[]).append(p)
+              names[label]=set(shaders)
+              reports += [f"## {label}: {len(shaders)} shader names, {sum(map(len,shaders.values()))} shader files"]
+              chosen=set()
+              for p in assets.rglob("*.asset"):
+                  t=p.read_text(errors="ignore")
+                  if any(k in p.name.lower() for k in ("renderer","mask","pipeline")) or any(k in t for k in ("m_RendererDataList:","m_RendererFeatures:")): chosen.add(p)
+              for p in (root/"ProjectSettings").glob("*.asset") if (root/"ProjectSettings").exists() else []:
+                  if p.name in ("GraphicsSettings.asset","QualitySettings.asset","ProjectSettings.asset"): chosen.add(p)
+              for p in assets.rglob("*.mat"):
+                  t=p.read_text(errors="ignore"); q=re.search(r"m_Shader:\s*\{[^}]*guid:\s*([0-9a-f]{32})",t)
+                  shader=guids.get(q.group(1),"unknown") if q else "missing reference"
+                  reports.append(f"{label} material {p.relative_to(root)} -> {shader}")
+                  chosen.add(p)
+              for p in sorted(shaders.values(),key=lambda x:str(x[0])):
+                  chosen.update(p)
+              for ext in ("*.prefab","*.unity"):
+                  for p in assets.rglob(ext):
+                      t=p.read_text(errors="ignore")
+                      if any(k in t for k in ("m_RequiresDepthTexture","m_RequiresColorTexture","m_CameraType","m_RendererIndex")): chosen.add(p)
+              for p in chosen:
+                  if p.exists():
+                      dest=stage/label/p.relative_to(root); dest.parent.mkdir(parents=True,exist_ok=True); dest.write_bytes(p.read_bytes())
+                      m=Path(str(p)+".meta")
+                      if m.exists():
+                          dm=stage/label/m.relative_to(root); dm.parent.mkdir(parents=True,exist_ok=True); dm.write_bytes(m.read_bytes())
+              for setting in ("GraphicsSettings.asset","QualitySettings.asset","ProjectSettings.asset"):
+                  p=root/"ProjectSettings"/setting
+                  if p.exists():
+                      reports.append("### "+label+" "+setting)
+                      reports.extend(x for x in p.read_text(errors="ignore").splitlines() if any(k in x for k in ("m_CustomRenderPipeline","m_RenderPipeline","m_RendererDataList","m_DefaultRendererIndex","m_ColorSpace","m_BuildTargetGraphicsAPIs")))
+              reports.append("### "+label+" renderer assets")
+              for p in sorted(chosen):
+                  if p.suffix==".asset" and any(k in p.name.lower() for k in ("renderer","mask","pipeline")):
+                      reports.append("#### "+str(p.relative_to(root))); reports.append(p.read_text(errors="ignore")[:30000])
+              reports.append("### "+label+" shaders")
+              for n in sorted(shaders): reports.append(n+" :: "+", ".join(str(p.relative_to(root)) for p in shaders[n]))
+          reports += ["## Android-only shader names",", ".join(sorted(names["android"]-names["windows"])),"## PC-only shader names",", ".join(sorted(names["windows"]-names["android"]))]
+          Path("renderer-comparison.md").write_text("\n".join(reports)+"\n")
+          with tarfile.open("renderer-assets.tar.gz","w:gz") as tar:
+              for p in stage.rglob("*"):
+                  if p.is_file(): tar.add(p,arcname=p.relative_to(stage))
+          print("report lines:",len(reports),"selected files:",sum(1 for p in stage.rglob("*") if p.is_file()))
+          PY
+          du -sh renderer-comparison.md renderer-assets.tar.gz
+      - name: Publish results to a unique release
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="renderer-compare-$GITHUB_RUN_ID"
+          files=""
+          for f in renderer-comparison.md renderer-assets.tar.gz android-ar.log android-ar-stdout.log windows-ar.log windows-ar-stdout.log; do [ -s "$f" ] && files="$files $f"; done
+          if [ -n "$files" ]; then gh release create "$TAG" $files --repo "$GITHUB_REPOSITORY" --title "Renderer comparison $GITHUB_RUN_ID" --notes "AssetRipper comparison of working Android APK and PC Game.zip."; fi
