@@ -19,6 +19,49 @@ on:
           - Dummy
           - Decompile
           - Yaml
+      game:
+        description: "Which game to build"
+        type: choice
+        default: baldi_plus
+        options:
+          - baldi_plus
+          - family_time
+      release_tag:
+        description: "Release tag that holds the game zip (empty = default for the game: game1 / familytime)"
+        type: string
+        default: ""
+      asset_name:
+        description: "Zip file name in that release (empty = default for the game)"
+        type: string
+        default: ""
+      scripting_backend:
+        description: "Scripting backend (Auto = Mono for baldi_plus, IL2CPP for family_time)"
+        type: choice
+        default: Auto
+        options:
+          - Auto
+          - Mono
+          - IL2CPP
+      graphics_api:
+        description: "family_time only: which graphics API to build for"
+        type: choice
+        default: OpenGLES3
+        options:
+          - OpenGLES3
+          - Vulkan
+          - Auto
+      touch_mode:
+        description: "family_time only: what the touch controls pretend to be"
+        type: choice
+        default: Both
+        options:
+          - Both
+          - Gamepad
+          - KeyboardMouse
+      urp_safe_settings:
+        description: "family_time only: turn off URP Opaque Texture (fixes invisible/black output on some phones)"
+        type: boolean
+        default: true
 
 jobs:
   build:
@@ -32,12 +75,53 @@ jobs:
           sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/swift /opt/hostedtoolcache/CodeQL
           df -h /
 
+      - name: Resolve game settings
+        env:
+          GAME: ${{ inputs.game }}
+          BACKEND: ${{ inputs.scripting_backend }}
+          GFX: ${{ inputs.graphics_api }}
+        run: |
+          if [ "$GAME" = "family_time" ]; then
+            UNITY_VER=6000.2.12f1
+            SCRIPTING=IL2CPP
+            MIN_SDK=25
+            GRAPHICS_API="$GFX"
+          else
+            UNITY_VER=2020.3.49f1
+            SCRIPTING=Mono
+            MIN_SDK=22
+            GRAPHICS_API=Auto
+          fi
+          if [ "$BACKEND" != "Auto" ]; then SCRIPTING="$BACKEND"; fi
+          if [ "$SCRIPTING" = "IL2CPP" ]; then ARCH=ARM64; else ARCH=ARMv7; fi
+          {
+            echo "UNITY_VER=$UNITY_VER"
+            echo "SCRIPTING=$SCRIPTING"
+            echo "ARCH=$ARCH"
+            echo "MIN_SDK=$MIN_SDK"
+            echo "GRAPHICS_API=$GRAPHICS_API"
+          } >> "$GITHUB_ENV"
+          echo "game=$GAME unity=$UNITY_VER scripting=$SCRIPTING arch=$ARCH minSdk=$MIN_SDK graphicsApi=$GRAPHICS_API"
+
       - name: Download and unzip game
         env:
           GH_TOKEN: ${{ github.token }}
+          GAME: ${{ inputs.game }}
+          IN_TAG: ${{ inputs.release_tag }}
+          IN_ASSET: ${{ inputs.asset_name }}
         run: |
+          if [ "$GAME" = "family_time" ]; then
+            DEF_TAG=familytime
+            DEF_ASSET="Family_Time_Ep_3_WINDOWS_DX11_b108.zip"
+          else
+            DEF_TAG=game1
+            DEF_ASSET="Game.zip"
+          fi
+          TAG="${IN_TAG:-$DEF_TAG}"
+          ASSET="${IN_ASSET:-$DEF_ASSET}"
+          echo "Downloading $ASSET from release $TAG"
           mkdir game
-          gh release download game1 --repo ${{ github.repository }} -p "Game.zip" -O game.zip
+          gh release download "$TAG" --repo ${{ github.repository }} -p "$ASSET" -O game.zip
           unzip -q game.zip -d game
           test -n "$(find game -name globalgamemanagers | head -n 1)" || { echo "ERROR: game files not found"; exit 1; }
 
@@ -90,6 +174,7 @@ jobs:
           du -sh export
 
       - name: Inspect original Plus render pipeline before Android patches
+        if: ${{ inputs.game == 'baldi_plus' }}
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -153,6 +238,7 @@ jobs:
           PY
 
       - name: Preserve the original Plus renderer for Android runtime loading
+        if: ${{ inputs.game == 'baldi_plus' }}
         run: |
           ASSETS=export/ExportedProject/Assets
           RENDERER=$(find "$ASSETS" -type f -name "UniversalRenderPipelineAsset_Renderer.asset" | head -n 1)
@@ -166,11 +252,11 @@ jobs:
             echo "WARNING: original URP renderer asset not found; runtime will use the fallback renderer"
           fi
 
-      - name: Install Unity 2020.3.49f1 with Android
+      - name: Install Unity with Android
         uses: RageAgainstThePixel/unity-setup@v2
         with:
           version-file: None
-          unity-version: 2020.3.49f1
+          unity-version: ${{ env.UNITY_VER }}
           build-targets: Android
           hub-version: '3.14.3'
           cache-installation: true
@@ -183,6 +269,7 @@ jobs:
           password: ${{ secrets.UNITY_PASSWORD }}
 
       - name: Install libssl1.1 for Unity's C# compiler
+        if: ${{ inputs.game == 'baldi_plus' }}
         run: |
           echo "deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://security.ubuntu.com/ubuntu focal-security main" | sudo tee /etc/apt/sources.list.d/focal-security.list
           sudo apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/focal-security.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
@@ -190,6 +277,7 @@ jobs:
           ldconfig -p | grep "libssl.so.1.1" || { echo "ERROR: libssl1.1 not installed"; exit 1; }
 
       - name: Patch game scripts for Android
+        if: ${{ inputs.game == 'baldi_plus' }}
         run: |
           SCRIPTS=$(find export/ExportedProject/Assets -type d -name "Assembly-CSharp" | head -n 1)
           echo "Scripts folder: $SCRIPTS"
@@ -1054,6 +1142,7 @@ jobs:
           python3 patch_map_and_lightmap.py
 
       - name: Patch camera data for Android
+        if: ${{ inputs.game == 'baldi_plus' }}
         run: |
           cat > patch_cameras.py << 'EOF'
           import os, subprocess
@@ -1141,6 +1230,7 @@ jobs:
           python3 patch_cameras.py
 
       - name: Repair Map component for Android
+        if: ${{ inputs.game == 'baldi_plus' }}
         run: |
           cat > patch_map.py << 'EOF_MAP'
           import os, shutil, subprocess
@@ -1339,6 +1429,7 @@ jobs:
           python3 patch_map.py
 
       - name: Patch URP renderer for Android
+        if: ${{ inputs.game == 'baldi_plus' }}
         run: |
           SCRIPTS=$(find export/ExportedProject/Assets -type d -name "Assembly-CSharp" | head -n 1)
           test -n "$SCRIPTS" || { echo "ERROR: scripts folder not found"; exit 1; }
@@ -1650,6 +1741,7 @@ jobs:
           if [ -f "$BLIT" ]; then cp blit.shader "$BLIT"; echo "Replaced the Blit shader"; else echo "WARNING: Blit shader file not found"; fi
 
       - name: Replace stand-in shaders with working ones
+        if: ${{ inputs.game == 'baldi_plus' }}
         run: |
           cat > write_shaders.py << 'EOF_PY'
           import os
@@ -2400,6 +2492,339 @@ jobs:
           EOF_PY
           python3 write_shaders.py
 
+      - name: Fix packages and settings for Family Time
+        if: ${{ inputs.game == 'family_time' }}
+        env:
+          URP_SAFE: ${{ inputs.urp_safe_settings }}
+        run: |
+          cat > fix_ft.py << 'EOF_FT'
+          import json, os, re, glob
+
+          proj = "export/ExportedProject"
+          os.makedirs(proj + "/Packages", exist_ok=True)
+          mpath = proj + "/Packages/manifest.json"
+          if os.path.exists(mpath):
+              manifest = json.load(open(mpath))
+          else:
+              manifest = {"dependencies": {}}
+          deps = manifest.setdefault("dependencies", {})
+          print("Packages before:", json.dumps(deps, indent=1))
+
+          want = {
+              "com.unity.render-pipelines.universal": "17.2.0",
+              "com.unity.visualeffectgraph": "17.2.0",
+              "com.unity.inputsystem": "1.14.0",
+              "com.unity.ugui": "2.0.0",
+          }
+          for k in ["ai", "androidjni", "animation", "assetbundle", "audio", "cloth", "director", "imgui",
+                    "jsonserialize", "particlesystem", "physics", "physics2d", "screencapture", "terrain",
+                    "tilemap", "ui", "uielements", "unitywebrequest", "unitywebrequestassetbundle",
+                    "unitywebrequestaudio", "unitywebrequesttexture", "video", "vfx", "wind"]:
+              want["com.unity.modules." + k] = "1.0.0"
+          added = []
+          for k, v in want.items():
+              if k not in deps:
+                  deps[k] = v
+                  added.append(k)
+          json.dump(manifest, open(mpath, "w"), indent=2)
+          print("Added packages:", added)
+
+          # make sure the new Input System is active
+          ps = proj + "/ProjectSettings/ProjectSettings.asset"
+          text = open(ps, errors="ignore").read()
+          m = re.search(r"^  activeInputHandler: (\d+)", text, re.M)
+          print("activeInputHandler =", m.group(1) if m else "not found")
+          if m and m.group(1) == "0":
+              text = text.replace(m.group(0), "  activeInputHandler: 2")
+              open(ps, "w").write(text)
+              print("activeInputHandler changed to 2 (both)")
+
+          # URP safe settings
+          if os.environ.get("URP_SAFE") == "true":
+              n = 0
+              for f in glob.glob(proj + "/Assets/**/*.asset", recursive=True):
+                  try:
+                      t = open(f, errors="ignore").read()
+                  except OSError:
+                      continue
+                  if "m_RequireOpaqueTexture:" in t and "m_RendererDataList" in t:
+                      t2 = t.replace("m_RequireOpaqueTexture: 1", "m_RequireOpaqueTexture: 0")
+                      print("URP asset:", f, "-> opaque texture off" if t2 != t else "-> already off")
+                      if t2 != t:
+                          open(f, "w").write(t2)
+                      n += 1
+              print("URP assets found:", n)
+              if n == 0:
+                  print("WARNING: no URP pipeline asset found in the export. Rendering will probably be black.")
+
+          # report what the export looks like, to help with the next iteration
+          gs = proj + "/ProjectSettings/GraphicsSettings.asset"
+          if os.path.exists(gs):
+              for line in open(gs, errors="ignore"):
+                  if "m_CustomRenderPipeline" in line or "m_RenderPipeline" in line:
+                      print("GraphicsSettings:", line.strip())
+          for f in glob.glob(proj + "/Assets/**/*.inputactions", recursive=True):
+              print("InputActions asset:", f)
+          EOF_FT
+          python3 fix_ft.py
+
+      - name: Add touch controls for Family Time
+        if: ${{ inputs.game == 'family_time' }}
+        env:
+          TOUCH_MODE: ${{ inputs.touch_mode }}
+        run: |
+          mkdir -p export/ExportedProject/Assets/FlintTouch
+          cat > export/ExportedProject/Assets/FlintTouch/FlintTouchOverlay.cs << 'EOF_TOUCH'
+          using System.Collections.Generic;
+          using UnityEngine;
+          using UnityEngine.InputSystem;
+          using UnityEngine.InputSystem.LowLevel;
+          using ETouch = UnityEngine.InputSystem.EnhancedTouch;
+
+          // On-screen touch controls for the Android port.
+          // Feeds virtual Gamepad / Keyboard / Mouse devices into the new Input System,
+          // so the game's existing input bindings keep working without editing its code.
+          public class FlintTouchOverlay : MonoBehaviour
+          {
+          	// Replaced by the workflow: Gamepad, KeyboardMouse or Both
+          	const string Mode = "__TOUCH_MODE__";
+          	// Tuning: raise to turn faster, lower to turn slower
+          	const float LookPadScale = 0.08f;
+          	const float LookMouseScale = 1.0f;
+
+          	class Btn
+          	{
+          		public string label;
+          		public Vector2 center;
+          		public float radius;
+          		public GamepadButton pad;
+          		public Key key;
+          	}
+
+          	List<Btn> buttons = new List<Btn>();
+          	Dictionary<int, Btn> fingerBtn = new Dictionary<int, Btn>();
+          	HashSet<Btn> held = new HashSet<Btn>();
+          	int joyId = -1;
+          	int lookId = -1;
+          	Vector2 joyOrigin;
+          	Vector2 joyVec;
+          	Vector2 lookDelta;
+          	bool usePad;
+          	bool useKb;
+          	Gamepad pad;
+          	Keyboard kb;
+          	Mouse mouse;
+          	Texture2D circle;
+          	GUIStyle style;
+
+          	[RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+          	static void Boot()
+          	{
+          		if (!Application.isMobilePlatform) return;
+          		if (FindObjectOfType<FlintTouchOverlay>() != null) return;
+          		GameObject go = new GameObject("FlintTouchOverlay");
+          		DontDestroyOnLoad(go);
+          		go.AddComponent<FlintTouchOverlay>();
+          	}
+
+          	void Awake()
+          	{
+          		usePad = Mode != "KeyboardMouse";
+          		useKb = Mode != "Gamepad";
+          		ETouch.EnhancedTouchSupport.Enable();
+          		if (usePad) pad = InputSystem.AddDevice<Gamepad>("FlintTouchGamepad");
+          		if (useKb)
+          		{
+          			kb = InputSystem.AddDevice<Keyboard>("FlintTouchKeyboard");
+          			mouse = InputSystem.AddDevice<Mouse>("FlintTouchMouse");
+          		}
+          		circle = MakeCircle(64);
+          		Debug.Log("FLINTTOUCH: started, mode=" + Mode + " pad=" + usePad + " keyboardMouse=" + useKb);
+          	}
+
+          	static Texture2D MakeCircle(int size)
+          	{
+          		Texture2D tex = new Texture2D(size, size, TextureFormat.RGBA32, false);
+          		float r = size / 2f;
+          		for (int y = 0; y < size; y++)
+          		{
+          			for (int x = 0; x < size; x++)
+          			{
+          				float dx = x + 0.5f - r;
+          				float dy = y + 0.5f - r;
+          				float a = Mathf.Clamp01(r - Mathf.Sqrt(dx * dx + dy * dy));
+          				tex.SetPixel(x, y, new Color(1f, 1f, 1f, a));
+          			}
+          		}
+          		tex.Apply();
+          		return tex;
+          	}
+
+          	void Add(string label, float x, float y, float radius, GamepadButton p, Key k, float s)
+          	{
+          		Btn b = new Btn();
+          		b.label = label;
+          		b.center = new Vector2(x, y);
+          		b.radius = radius * s;
+          		b.pad = p;
+          		b.key = k;
+          		buttons.Add(b);
+          	}
+
+          	void BuildButtons()
+          	{
+          		float s = Screen.height / 720f;
+          		float w = Screen.width;
+          		float h = Screen.height;
+          		held.Clear();
+          		buttons.Clear();
+          		Add("JUMP", w - 130f * s, 170f * s, 75f, GamepadButton.South, Key.Space, s);
+          		Add("USE", w - 290f * s, 110f * s, 55f, GamepadButton.West, Key.E, s);
+          		Add("RUN", w - 110f * s, 340f * s, 55f, GamepadButton.LeftStick, Key.LeftShift, s);
+          		Add("DUCK", w - 280f * s, 270f * s, 45f, GamepadButton.East, Key.LeftCtrl, s);
+          		Add("ITEM", w - 430f * s, 110f * s, 45f, GamepadButton.North, Key.Q, s);
+          		Add("II", w - 60f * s, h - 60f * s, 38f, GamepadButton.Start, Key.Escape, s);
+          		foreach (KeyValuePair<int, Btn> pair in fingerBtn) held.Add(pair.Value);
+          	}
+
+          	Btn Hit(Vector2 p)
+          	{
+          		for (int i = 0; i < buttons.Count; i++)
+          		{
+          			if ((p - buttons[i].center).magnitude <= buttons[i].radius * 1.25f) return buttons[i];
+          		}
+          		return null;
+          	}
+
+          	void Update()
+          	{
+          		BuildButtons();
+          		float s = Screen.height / 720f;
+          		lookDelta = Vector2.zero;
+          		var touches = ETouch.Touch.activeTouches;
+          		for (int i = 0; i < touches.Count; i++)
+          		{
+          			var t = touches[i];
+          			int id = t.touchId;
+          			Vector2 p = t.screenPosition;
+          			UnityEngine.InputSystem.TouchPhase phase = t.phase;
+          			if (phase == UnityEngine.InputSystem.TouchPhase.Began)
+          			{
+          				Btn b = Hit(p);
+          				if (b != null)
+          				{
+          					fingerBtn[id] = b;
+          					held.Add(b);
+          				}
+          				else if (joyId < 0 && p.x < Screen.width * 0.4f)
+          				{
+          					joyId = id;
+          					joyOrigin = p;
+          					joyVec = Vector2.zero;
+          				}
+          				else if (lookId < 0)
+          				{
+          					lookId = id;
+          				}
+          			}
+          			else if (phase == UnityEngine.InputSystem.TouchPhase.Moved || phase == UnityEngine.InputSystem.TouchPhase.Stationary)
+          			{
+          				if (id == joyId) joyVec = Vector2.ClampMagnitude((p - joyOrigin) / (90f * s), 1f);
+          				else if (id == lookId) lookDelta += t.delta;
+          			}
+          			else if (phase == UnityEngine.InputSystem.TouchPhase.Ended || phase == UnityEngine.InputSystem.TouchPhase.Canceled)
+          			{
+          				Btn b;
+          				if (fingerBtn.TryGetValue(id, out b))
+          				{
+          					held.Remove(b);
+          					fingerBtn.Remove(id);
+          				}
+          				if (id == joyId)
+          				{
+          					joyId = -1;
+          					joyVec = Vector2.zero;
+          				}
+          				if (id == lookId) lookId = -1;
+          			}
+          		}
+          		if (touches.Count == 0)
+          		{
+          			fingerBtn.Clear();
+          			held.Clear();
+          			joyId = -1;
+          			lookId = -1;
+          			joyVec = Vector2.zero;
+          		}
+          		if (usePad && pad != null)
+          		{
+          			GamepadState gs = new GamepadState();
+          			gs.leftStick = joyVec;
+          			gs.rightStick = Vector2.ClampMagnitude(lookDelta * LookPadScale, 1f);
+          			foreach (Btn b in held) gs = gs.WithButton(b.pad);
+          			InputSystem.QueueStateEvent(pad, gs);
+          		}
+          		if (useKb && kb != null && mouse != null)
+          		{
+          			List<Key> keys = new List<Key>();
+          			if (joyVec.y > 0.35f) keys.Add(Key.W);
+          			if (joyVec.y < -0.35f) keys.Add(Key.S);
+          			if (joyVec.x > 0.35f) keys.Add(Key.D);
+          			if (joyVec.x < -0.35f) keys.Add(Key.A);
+          			foreach (Btn b in held) keys.Add(b.key);
+          			InputSystem.QueueStateEvent(kb, new KeyboardState(keys.ToArray()));
+          			MouseState ms = new MouseState();
+          			ms.position = new Vector2(Screen.width / 2f, Screen.height / 2f);
+          			ms.delta = lookDelta * LookMouseScale;
+          			InputSystem.QueueStateEvent(mouse, ms);
+          		}
+          	}
+
+          	void Disc(Rect r, float ring, float fill)
+          	{
+          		GUI.color = new Color(1f, 1f, 1f, ring);
+          		GUI.DrawTexture(r, circle);
+          		float m = r.width * 0.07f;
+          		GUI.color = new Color(0f, 0f, 0f, fill);
+          		GUI.DrawTexture(new Rect(r.x + m, r.y + m, r.width - m * 2f, r.height - m * 2f), circle);
+          		GUI.color = Color.white;
+          	}
+
+          	void OnGUI()
+          	{
+          		if (Event.current.type != EventType.Repaint || circle == null) return;
+          		if (style == null)
+          		{
+          			style = new GUIStyle(GUI.skin.label);
+          			style.alignment = TextAnchor.MiddleCenter;
+          			style.fontStyle = FontStyle.Bold;
+          			style.normal.textColor = Color.white;
+          		}
+          		float s = Screen.height / 720f;
+          		style.fontSize = Mathf.RoundToInt(22f * s);
+          		for (int i = 0; i < buttons.Count; i++)
+          		{
+          			Btn b = buttons[i];
+          			bool on = held.Contains(b);
+          			Rect r = new Rect(b.center.x - b.radius, Screen.height - b.center.y - b.radius, b.radius * 2f, b.radius * 2f);
+          			Disc(r, on ? 0.9f : 0.55f, on ? 0.7f : 0.4f);
+          			GUI.color = Color.white;
+          			GUI.Label(r, b.label, style);
+          		}
+          		if (joyId >= 0)
+          		{
+          			float big = 90f * s;
+          			float small = 40f * s;
+          			Disc(new Rect(joyOrigin.x - big, Screen.height - joyOrigin.y - big, big * 2f, big * 2f), 0.4f, 0.25f);
+          			Vector2 knob = joyOrigin + joyVec * big;
+          			Disc(new Rect(knob.x - small, Screen.height - knob.y - small, small * 2f, small * 2f), 0.8f, 0.6f);
+          		}
+          	}
+          }
+          EOF_TOUCH
+          sed -i "s/__TOUCH_MODE__/$TOUCH_MODE/" export/ExportedProject/Assets/FlintTouch/FlintTouchOverlay.cs
+          grep -n "const string Mode" export/ExportedProject/Assets/FlintTouch/FlintTouchOverlay.cs
+
       - name: Add build script
         run: |
           mkdir -p export/ExportedProject/Assets/Editor
@@ -2434,6 +2859,38 @@ jobs:
                   }
               }
 
+              private static string Env(string name, string fallback)
+              {
+                  string v = Environment.GetEnvironmentVariable(name);
+                  return string.IsNullOrEmpty(v) ? fallback : v;
+              }
+
+              private static void ConfigureAndroid()
+              {
+                  bool il2cpp = Env("SCRIPTING", "Mono") == "IL2CPP";
+                  string arch = Env("ARCH", "ARMv7");
+                  int minSdk;
+                  if (!int.TryParse(Env("MIN_SDK", "22"), out minSdk)) minSdk = 22;
+                  string api = Env("GRAPHICS_API", "Auto");
+          #if UNITY_6000_0_OR_NEWER
+                  UnityEditor.Build.NamedBuildTarget target = UnityEditor.Build.NamedBuildTarget.Android;
+                  PlayerSettings.SetApplicationIdentifier(target, "com.epic.gameport");
+                  PlayerSettings.SetScriptingBackend(target, il2cpp ? ScriptingImplementation.IL2CPP : ScriptingImplementation.Mono2x);
+                  if (il2cpp) PlayerSettings.SetManagedStrippingLevel(target, ManagedStrippingLevel.Minimal);
+          #else
+                  PlayerSettings.SetApplicationIdentifier(BuildTargetGroup.Android, "com.epic.gameport");
+                  PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, il2cpp ? ScriptingImplementation.IL2CPP : ScriptingImplementation.Mono2x);
+          #endif
+                  PlayerSettings.Android.targetArchitectures = (arch == "ARM64") ? AndroidArchitecture.ARM64 : AndroidArchitecture.ARMv7;
+                  PlayerSettings.Android.minSdkVersion = (AndroidSdkVersions)minSdk;
+                  if (api == "OpenGLES3" || api == "Vulkan")
+                  {
+                      PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.Android, false);
+                      PlayerSettings.SetGraphicsAPIs(BuildTarget.Android, new[] { api == "Vulkan" ? UnityEngine.Rendering.GraphicsDeviceType.Vulkan : UnityEngine.Rendering.GraphicsDeviceType.OpenGLES3 });
+                  }
+                  Console.WriteLine("CIBuild: backend=" + (il2cpp ? "IL2CPP" : "Mono") + " arch=" + arch + " minSdk=" + minSdk + " graphicsApi=" + api);
+              }
+
               public static void BuildAndroid()
               {
                   var scenes = new List<string>();
@@ -2448,12 +2905,9 @@ jobs:
                       return;
                   }
 
-                  PlayerSettings.SetApplicationIdentifier(BuildTargetGroup.Android, "com.epic.gameport");
+                  ConfigureAndroid();
                   PlayerSettings.Android.bundleVersionCode = 1;
                   PlayerSettings.bundleVersion = "1.0";
-                  PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, ScriptingImplementation.Mono2x);
-                  PlayerSettings.Android.targetArchitectures = AndroidArchitecture.ARMv7;
-                  PlayerSettings.Android.minSdkVersion = AndroidSdkVersions.AndroidApiLevel22;
                   EditorUserBuildSettings.buildAppBundle = false;
 
                   string outPath = Environment.GetEnvironmentVariable("APK_OUT");
@@ -2476,6 +2930,11 @@ jobs:
           EOF
 
       - name: Build APK
+        env:
+          SCRIPTING: ${{ env.SCRIPTING }}
+          ARCH: ${{ env.ARCH }}
+          MIN_SDK: ${{ env.MIN_SDK }}
+          GRAPHICS_API: ${{ env.GRAPHICS_API }}
         run: |
           EDITOR="$UNITY_EDITOR_PATH"
           if [ -d "$EDITOR" ]; then
