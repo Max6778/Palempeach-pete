@@ -43,12 +43,13 @@ on:
           - Mono
           - IL2CPP
       graphics_api:
-        description: "family_time only: which graphics API to build for"
+        description: "family_time only: graphics API (Vulkan_GLES3 = try Vulkan first, fall back to OpenGLES3; VFX Graph needs Vulkan)"
         type: choice
-        default: OpenGLES3
+        default: Vulkan_GLES3
         options:
-          - OpenGLES3
+          - Vulkan_GLES3
           - Vulkan
+          - OpenGLES3
           - Auto
       touch_mode:
         description: "family_time only: what the touch controls pretend to be"
@@ -72,7 +73,7 @@ jobs:
     steps:
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/swift /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/swift /opt/hostedtoolcache/CodeQL /usr/share/dotnet /usr/local/share/boost
           df -h /
 
       - name: Resolve game settings
@@ -2498,38 +2499,123 @@ jobs:
           URP_SAFE: ${{ inputs.urp_safe_settings }}
         run: |
           cat > fix_ft.py << 'EOF_FT'
-          import json, os, re, glob
+          import json, os, re, glob, urllib.request
 
           proj = "export/ExportedProject"
           os.makedirs(proj + "/Packages", exist_ok=True)
           mpath = proj + "/Packages/manifest.json"
-          if os.path.exists(mpath):
-              manifest = json.load(open(mpath))
-          else:
-              manifest = {"dependencies": {}}
+          manifest = json.load(open(mpath)) if os.path.exists(mpath) else {"dependencies": {}}
           deps = manifest.setdefault("dependencies", {})
           print("Packages before:", json.dumps(deps, indent=1))
 
-          want = {
-              "com.unity.render-pipelines.universal": "17.2.0",
-              "com.unity.visualeffectgraph": "17.2.0",
-              "com.unity.inputsystem": "1.14.0",
-              "com.unity.ugui": "2.0.0",
-          }
-          for k in ["ai", "androidjni", "animation", "assetbundle", "audio", "cloth", "director", "imgui",
-                    "jsonserialize", "particlesystem", "physics", "physics2d", "screencapture", "terrain",
-                    "tilemap", "ui", "uielements", "unitywebrequest", "unitywebrequestassetbundle",
-                    "unitywebrequestaudio", "unitywebrequesttexture", "video", "vfx", "wind"]:
-              want["com.unity.modules." + k] = "1.0.0"
-          added = []
-          for k, v in want.items():
-              if k not in deps:
-                  deps[k] = v
-                  added.append(k)
-          json.dump(manifest, open(mpath, "w"), indent=2)
-          print("Added packages:", added)
+          # ---- which assemblies does the export already contain (to avoid duplicates with packages)
+          existing = set()
+          for f in glob.glob(proj + "/Assets/**/*", recursive=True):
+              low = os.path.basename(f)
+              if low.endswith(".dll"):
+                  existing.add(low[:-4])
+              elif low.endswith(".asmdef"):
+                  try:
+                      existing.add(json.load(open(f, errors="ignore")).get("name", ""))
+                  except Exception:
+                      pass
+          print("Assemblies already in the export:", sorted(x for x in existing if x.startswith(("Unity", "Rewired", "Box3d")))[:40])
 
-          # make sure the new Input System is active
+          def add(name, version, assemblies=()):
+              if name in deps:
+                  print("keep   ", name, deps[name])
+                  return
+              dup = [a for a in assemblies if a in existing]
+              if dup:
+                  print("skip   ", name, "- export already has assembly", dup)
+                  return
+              if not version:
+                  print("skip   ", name, "- no version found")
+                  return
+              deps[name] = version
+              print("add    ", name, version)
+
+          # ---- core + verified packages for Unity 6000.2 (URP/VFX 17.2.0, Input System 1.14.0)
+          add("com.unity.render-pipelines.universal", "17.2.0", ["Unity.RenderPipelines.Universal.Runtime"])
+          add("com.unity.visualeffectgraph", "17.2.0", ["Unity.VisualEffectGraph.Runtime"])
+          add("com.unity.inputsystem", "1.14.0", ["Unity.InputSystem"])
+          add("com.unity.ugui", "2.0.0", ["UnityEngine.UI", "Unity.TextMeshPro"])
+
+          # ---- other registry packages: ask the registry for the newest version that supports 6000.2
+          def pick(name, fallback):
+              try:
+                  req = urllib.request.Request("https://packages.unity.com/" + name, headers={"Accept": "application/json"})
+                  data = json.load(urllib.request.urlopen(req, timeout=30))
+                  best = None
+                  for ver, info in data.get("versions", {}).items():
+                      if "-" in ver:
+                          continue
+                      try:
+                          maj, mi = [int(x) for x in str(info.get("unity", "2019.4")).split(".")[:2]]
+                          key = tuple(int(x) for x in ver.split("."))
+                      except Exception:
+                          continue
+                      if (maj, mi) > (6000, 2):
+                          continue
+                      if best is None or key > best[0]:
+                          best = (key, ver)
+                  if best:
+                      return best[1]
+              except Exception as e:
+                  print("registry lookup failed for", name, ":", e)
+              return fallback
+
+          add("com.unity.mathematics", pick("com.unity.mathematics", "1.3.2"), ["Unity.Mathematics"])
+          add("com.unity.burst", pick("com.unity.burst", None), ["Unity.Burst"])
+          add("com.unity.collections", pick("com.unity.collections", None), ["Unity.Collections"])
+
+          # ---- built-in modules: only add the ones this editor really ships
+          def find_builtin():
+              cands = []
+              ed = os.environ.get("UNITY_EDITOR_PATH", "")
+              while ed and ed != "/":
+                  cands.append(ed + "/Data/Resources/PackageManager/BuiltInPackages")
+                  cands.append(ed + "/Editor/Data/Resources/PackageManager/BuiltInPackages")
+                  ed = os.path.dirname(ed)
+              cands += glob.glob(os.path.expanduser("~/Unity/Hub/Editor/*/Editor/Data/Resources/PackageManager/BuiltInPackages"))
+              for c in cands:
+                  if os.path.isdir(c):
+                      return c
+              return None
+
+          WANT = ["ai", "androidjni", "animation", "assetbundle", "audio", "cloth", "director", "imageconversion",
+                  "imgui", "jsonserialize", "particlesystem", "physics", "physics2d", "screencapture", "terrain",
+                  "terrainphysics", "tilemap", "ui", "uielements", "umbra", "unitywebrequest",
+                  "unitywebrequestassetbundle", "unitywebrequestaudio", "unitywebrequesttexture", "video", "wind"]
+          # present in both the 6000.0 and 6000.3 docs, so safe if the editor folder cannot be found
+          SAFE = ["ai", "androidjni", "animation", "assetbundle", "audio", "cloth", "director", "imageconversion",
+                  "imgui", "jsonserialize", "particlesystem", "physics", "physics2d", "screencapture", "terrain",
+                  "terrainphysics", "tilemap", "ui", "uielements", "umbra", "unitywebrequest",
+                  "unitywebrequestassetbundle", "unitywebrequestaudio"]
+          bi = find_builtin()
+          print("Built-in packages folder:", bi)
+          for k in WANT if bi else SAFE:
+              name = "com.unity.modules." + k
+              ver = "1.0.0"
+              if bi:
+                  pj = os.path.join(bi, name, "package.json")
+                  if not os.path.exists(pj):
+                      print("skip    module not in this editor:", name)
+                      continue
+                  ver = json.load(open(pj)).get("version", "1.0.0")
+              if name not in deps:
+                  deps[name] = ver
+
+          # ---- AssetRipper can write module names that do not exist; remove them
+          for name in list(deps):
+              if name == "com.unity.modules.vfx" or (bi and name.startswith("com.unity.modules.") and not os.path.exists(os.path.join(bi, name, "package.json"))):
+                  print("remove  package that does not exist in this editor:", name)
+                  del deps[name]
+
+          json.dump(manifest, open(mpath, "w"), indent=2)
+          print("Packages after:", json.dumps(deps, indent=1))
+
+          # ---- make sure the new Input System is active
           ps = proj + "/ProjectSettings/ProjectSettings.asset"
           text = open(ps, errors="ignore").read()
           m = re.search(r"^  activeInputHandler: (\d+)", text, re.M)
@@ -2539,7 +2625,7 @@ jobs:
               open(ps, "w").write(text)
               print("activeInputHandler changed to 2 (both)")
 
-          # URP safe settings
+          # ---- URP safe settings
           if os.environ.get("URP_SAFE") == "true":
               n = 0
               for f in glob.glob(proj + "/Assets/**/*.asset", recursive=True):
@@ -2557,7 +2643,6 @@ jobs:
               if n == 0:
                   print("WARNING: no URP pipeline asset found in the export. Rendering will probably be black.")
 
-          # report what the export looks like, to help with the next iteration
           gs = proj + "/ProjectSettings/GraphicsSettings.asset"
           if os.path.exists(gs):
               for line in open(gs, errors="ignore"):
@@ -2621,7 +2706,7 @@ jobs:
           	static void Boot()
           	{
           		if (!Application.isMobilePlatform) return;
-          		if (FindObjectOfType<FlintTouchOverlay>() != null) return;
+          		if (FindFirstObjectByType<FlintTouchOverlay>() != null) return;
           		GameObject go = new GameObject("FlintTouchOverlay");
           		DontDestroyOnLoad(go);
           		go.AddComponent<FlintTouchOverlay>();
@@ -2883,10 +2968,14 @@ jobs:
           #endif
                   PlayerSettings.Android.targetArchitectures = (arch == "ARM64") ? AndroidArchitecture.ARM64 : AndroidArchitecture.ARMv7;
                   PlayerSettings.Android.minSdkVersion = (AndroidSdkVersions)minSdk;
-                  if (api == "OpenGLES3" || api == "Vulkan")
+                  if (api == "OpenGLES3" || api == "Vulkan" || api == "Vulkan_GLES3")
                   {
+                      UnityEngine.Rendering.GraphicsDeviceType[] apis;
+                      if (api == "Vulkan_GLES3") apis = new[] { UnityEngine.Rendering.GraphicsDeviceType.Vulkan, UnityEngine.Rendering.GraphicsDeviceType.OpenGLES3 };
+                      else if (api == "Vulkan") apis = new[] { UnityEngine.Rendering.GraphicsDeviceType.Vulkan };
+                      else apis = new[] { UnityEngine.Rendering.GraphicsDeviceType.OpenGLES3 };
                       PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.Android, false);
-                      PlayerSettings.SetGraphicsAPIs(BuildTarget.Android, new[] { api == "Vulkan" ? UnityEngine.Rendering.GraphicsDeviceType.Vulkan : UnityEngine.Rendering.GraphicsDeviceType.OpenGLES3 });
+                      PlayerSettings.SetGraphicsAPIs(BuildTarget.Android, apis);
                   }
                   Console.WriteLine("CIBuild: backend=" + (il2cpp ? "IL2CPP" : "Mono") + " arch=" + arch + " minSdk=" + minSdk + " graphicsApi=" + api);
               }
