@@ -14,7 +14,7 @@ on:
         required: true
         default: bbplus-apk
       apk_name:
-        description: "APK file name in that release"
+        description: "APK file name in that release (if it is not found, any .apk in the release is used)"
         required: true
         default: Baldis_Basics_Plus_V0_14_3_Android_Port.apk
       shader_mode:
@@ -48,7 +48,12 @@ jobs:
           TAG: ${{ inputs.apk_tag }}
           ASSET: ${{ inputs.apk_name }}
         run: |
-          gh release download "$TAG" --repo ${{ github.repository }} -p "$ASSET" -O game.apk
+          echo "Assets in release $TAG:"
+          gh release view "$TAG" --repo ${{ github.repository }} --json assets --jq '.assets[].name' || { echo "Release $TAG not found. Releases:"; gh release list --repo ${{ github.repository }}; exit 1; }
+          if ! gh release download "$TAG" --repo ${{ github.repository }} -p "$ASSET" -O game.apk; then
+            echo "No asset named $ASSET, trying any .apk in the release"
+            gh release download "$TAG" --repo ${{ github.repository }} -p "*.apk" -O game.apk || { echo "ERROR: no .apk file in release $TAG. Upload the APK to that release, or change apk_tag."; exit 1; }
+          fi
           ls -l game.apk
           mkdir apk
           unzip -q game.apk -d apk
