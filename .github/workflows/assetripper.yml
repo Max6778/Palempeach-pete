@@ -13,7 +13,7 @@ jobs:
         run: |
           mkdir game
           gh release download game2 --repo ${{ github.repository }} -p "Family_Time_Ep_3_WINDOWS_DX11_b108.zip" -O Family_Time_Ep_3_WINDOWS_DX11_b108.zip
-          unzip -q game.zip -d game
+          unzip -q Family_Time_Ep_3_WINDOWS_DX11_b108.zip -d game
 
       - name: Download AssetRipper
         env:
