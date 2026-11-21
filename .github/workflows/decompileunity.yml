@@ -3,9 +3,17 @@ name: Decompile Unity game
 on:
   workflow_dispatch:
     inputs:
-      game_url:
-        description: "Direct link to the game .zip (e.g. a GitHub Release asset)"
+      release_tag:
+        description: "Release tag that holds the game zip"
         required: true
+        default: familytime
+      asset_name:
+        description: "Game zip file name in that release"
+        required: true
+        default: Family_Time_Ep_3_WINDOWS_DX11_b108.zip
+
+permissions:
+  contents: write
 
 jobs:
   decompile:
@@ -14,36 +22,53 @@ jobs:
       - name: Download and unzip game
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          ASSET: ${{ inputs.asset_name }}
         run: |
           mkdir game
-                    gh release download game1 --repo ${{ github.repository }} -p "Game.zip" -O game.zip
+          gh release download "$TAG" --repo ${{ github.repository }} -p "$ASSET" -O game.zip
           unzip -q game.zip -d game
-
-      - name: Find Assembly-CSharp.dll
-        run: |
-          DLL=$(find game -name "Assembly-CSharp.dll" | head -n 1)
-          echo "Found: $DLL"
-          echo "DLL=$DLL" >> $GITHUB_ENV
 
       - name: Find Unity version
         run: |
           GGM=$(find game -name "globalgamemanagers" | head -n 1)
-          echo "Unity version:"
-          strings "$GGM" | grep -m1 -E '^[0-9]{4}\.[0-9]+\.[0-9]+[fpb][0-9]+' | tee unity_version.txt
+          strings "$GGM" | grep -m1 -oE '[0-9]{4}\.[0-9]+\.[0-9]+[fpb][0-9]+' | tee unity_version.txt
 
       - name: Install ILSpy command line
         run: |
           dotnet tool install -g ilspycmd
           echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
 
-      - name: Decompile
+      - name: Decompile the game's own DLLs
         run: |
-          mkdir -p out/Scripts
-          ilspycmd -p -o out/Scripts "$DLL"
+          MANAGED=$(dirname "$(find game -name "Assembly-CSharp.dll" | head -n 1)")
+          echo "Managed folder: $MANAGED"
+          mkdir -p out
           cp unity_version.txt out/
+          # Only the game's own code, not Unity/System libraries
+          for DLL in "$MANAGED"/*.dll; do
+            NAME=$(basename "$DLL" .dll)
+            case "$NAME" in
+              System*|Unity*|UnityEngine*|mscorlib|Mono.*|netstandard|Microsoft.*|nunit*|Newtonsoft*) continue ;;
+            esac
+            echo "Decompiling $NAME"
+            mkdir -p "out/$NAME"
+            ilspycmd -p -o "out/$NAME" "$DLL" || echo "FAILED: $NAME"
+          done
+          find out -name "*.cs" | wc -l
 
-      - name: Upload result
-        uses: actions/upload-artifact@v4
-        with:
-          name: decompiled
-          path: out
+      - name: Zip the result
+        run: |
+          cd out
+          zip -qr ../decompiled.zip .
+
+      - name: Publish to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="decompiled-${{ github.run_number }}"
+          gh release create "$TAG" decompiled.zip \
+            --repo ${{ github.repository }} \
+            --title "Decompiled game (run ${{ github.run_number }})" \
+            --notes "Unity $(cat unity_version.txt). Scripts decompiled with ILSpy."
+          echo "Release: https://github.com/${{ github.repository }}/releases/tag/$TAG"
