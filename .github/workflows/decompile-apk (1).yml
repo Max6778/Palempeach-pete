@@ -68,7 +68,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir dumper_dl dumper
-          gh release download --repo Perfare/Il2CppDumper -D dumper_dl
+          gh release download --repo Perfare/Il2CppDumper -p "*.zip" -D dumper_dl
           ls -la dumper_dl
           ZIP=""
           for k in net8 net7 net6 net; do
