@@ -3,6 +3,9 @@ name: Extract assets (AssetRipper)
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   rip:
     runs-on: ubuntu-latest
@@ -14,7 +17,6 @@ jobs:
           mkdir game
           gh release download game2 --repo ${{ github.repository }} -p "Family_Time_Ep_3_WINDOWS_DX11_b108.zip" -O Family_Time_Ep_3_WINDOWS_DX11_b108.zip
           unzip -q Family_Time_Ep_3_WINDOWS_DX11_b108.zip -d game
-
       - name: Download AssetRipper
         env:
           GH_TOKEN: ${{ github.token }}
@@ -34,7 +36,6 @@ jobs:
           echo "Found: $EXE"
           chmod +x "$EXE"
           echo "EXE=$PWD/$EXE" >> $GITHUB_ENV
-
       - name: Run AssetRipper
         run: |
           DATA=$(dirname "$(find game -name globalgamemanagers | head -n 1)")
@@ -50,15 +51,24 @@ jobs:
           sleep 5
           pkill -f AssetRipper || true
           du -sh export
-
       - name: Show logs
         if: always()
         run: |
           tail -n 40 ar.log || true
           tail -n 40 ar_stdout.log || true
-
-      - name: Upload result
-        uses: actions/upload-artifact@v4
-        with:
-          name: unity-project
-          path: export
+      - name: Zip the exported project
+        run: |
+          cd export
+          zip -qr ../unity-project.zip .
+          cd ..
+          ls -lh unity-project.zip
+      - name: Publish to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="unity-project-${{ github.run_number }}"
+          gh release create "$TAG" unity-project.zip \
+            --repo ${{ github.repository }} \
+            --title "Unity project export (run ${{ github.run_number }})" \
+            --notes "AssetRipper export of Family Time Ep 3."
+          echo "Release: https://github.com/${{ github.repository }}/releases/tag/$TAG"
