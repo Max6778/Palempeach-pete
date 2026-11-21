@@ -12,7 +12,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir game
-          gh release download game1 --repo ${{ github.repository }} -p "Game.zip" -O game.zip
+          gh release download game2 --repo ${{ github.repository }} -p "Family_Time_Ep_3_WINDOWS_DX11_b108.zip" -O Family_Time_Ep_3_WINDOWS_DX11_b108.zip
           unzip -q game.zip -d game
 
       - name: Download AssetRipper
