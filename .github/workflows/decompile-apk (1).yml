@@ -1,0 +1,322 @@
+name: Decompile APK (AssetRipper + Il2CppDumper)
+
+# Takes a working Unity Android APK and extracts everything useful from it:
+#  1. the Unity project (scenes, materials, shaders, URP settings) with AssetRipper
+#  2. the C# class list from the IL2CPP build with Il2CppDumper
+#  3. a short report.md that lists the graphics/URP/shader settings of the APK
+# Everything is published to a GitHub release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_tag:
+        description: "Release tag that holds the APK"
+        required: true
+        default: bbplus-apk
+      apk_name:
+        description: "APK file name in that release"
+        required: true
+        default: Baldis_Basics_Plus_V0_14_3_Android_Port.apk
+      shader_mode:
+        description: "How AssetRipper exports shaders"
+        type: choice
+        default: Decompile
+        options:
+          - Decompile
+          - Yaml
+          - Dummy
+      script_mode:
+        description: "How AssetRipper exports scripts"
+        type: choice
+        default: Decompiled
+        options:
+          - Decompiled
+          - Hybrid
+          - DllExportWithoutRenaming
+
+permissions:
+  contents: write
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Download and unpack the APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.apk_tag }}
+          ASSET: ${{ inputs.apk_name }}
+        run: |
+          gh release download "$TAG" --repo ${{ github.repository }} -p "$ASSET" -O game.apk
+          ls -l game.apk
+          mkdir apk
+          unzip -q game.apk -d apk
+          ls apk apk/lib apk/assets/bin/Data
+          LIBUNITY=$(find apk/lib -name libunity.so | head -n 1)
+          strings "$LIBUNITY" | grep -m1 -oE '[0-9]{4}\.[0-9]+\.[0-9]+[fpb][0-9]+' | tee unity_version.txt
+          find apk -name libil2cpp.so
+          find apk -name global-metadata.dat
+
+      - name: Download Il2CppDumper
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir dumper_dl dumper
+          gh release download --repo Perfare/Il2CppDumper -D dumper_dl
+          ls -la dumper_dl
+          ZIP=""
+          for k in net8 net7 net6 net; do
+            ZIP=$(ls dumper_dl/*.zip | grep -i "$k" | grep -vi "win" | head -n 1)
+            [ -n "$ZIP" ] && break
+          done
+          [ -n "$ZIP" ] || ZIP=$(ls dumper_dl/*.zip | head -n 1)
+          echo "Using $ZIP"
+          unzip -q "$ZIP" -d dumper
+          find dumper -maxdepth 2 | head -20
+
+      - name: Run Il2CppDumper (class and method list)
+        continue-on-error: true
+        env:
+          DOTNET_ROLL_FORWARD: Major
+        run: |
+          DLL=$(find dumper -name Il2CppDumper.dll | head -n 1)
+          CFG=$(dirname "$DLL")/config.json
+          echo "Dumper: $DLL"
+          sed -i 's/"RequireAnyKey": *true/"RequireAnyKey": false/' "$CFG" || true
+          LIB=$(find apk/lib/arm64-v8a -name libil2cpp.so | head -n 1)
+          META=$(find apk -name global-metadata.dat | head -n 1)
+          mkdir -p il2cpp_out
+          dotnet "$DLL" "$LIB" "$META" il2cpp_out < /dev/null
+          ls -la il2cpp_out
+          wc -l il2cpp_out/dump.cs || true
+
+      - name: Download AssetRipper
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir ar_dl ar
+          gh release download --repo AssetRipper/AssetRipper -p "*linux_x64*" -D ar_dl
+          ls -la ar_dl
+          for f in ar_dl/*; do
+            case "$f" in
+              *.zip) unzip -q "$f" -d ar ;;
+              *.tar.gz|*.tgz) tar -xzf "$f" -C ar ;;
+              *.tar.xz) tar -xJf "$f" -C ar ;;
+              *.tar) tar -xf "$f" -C ar ;;
+            esac
+          done
+          EXE=$(find ar -name "AssetRipper.GUI.Free" -type f | head -n 1)
+          test -n "$EXE" || { echo "ERROR: AssetRipper not found"; ls -R ar_dl; exit 1; }
+          chmod +x "$EXE"
+          echo "EXE=$PWD/$EXE" >> $GITHUB_ENV
+
+      - name: Export Unity project with AssetRipper
+        run: |
+          start_ar() {
+            "$EXE" --headless --port 5000 --log-path "$PWD/ar.log" > ar_stdout.log 2>&1 &
+            for i in $(seq 1 30); do
+              curl -s http://127.0.0.1:5000 > /dev/null && break
+              sleep 2
+            done
+            curl -s -o /dev/null -w "settings http %{http_code}\n" -X POST \
+              --data-urlencode "ScriptExportMode=${{ inputs.script_mode }}" \
+              --data-urlencode "ShaderExportMode=${{ inputs.shader_mode }}" \
+              http://127.0.0.1:5000/Settings/Update
+          }
+          export_now() {
+            curl -s -o /dev/null -w "export http %{http_code}\n" --max-time 3000 -X POST \
+              --data-urlencode "Path=$PWD/export" http://127.0.0.1:5000/Export/UnityProject
+            sleep 5
+          }
+
+          # attempt 1: the unpacked APK folder
+          start_ar
+          curl -s -o /dev/null -w "load folder http %{http_code}\n" --max-time 900 -X POST \
+            --data-urlencode "Path=$PWD/apk" http://127.0.0.1:5000/LoadFolder
+          export_now
+          pkill -f AssetRipper || true
+          sleep 3
+
+          # attempt 2: the .apk file itself
+          if [ ! -d export/ExportedProject/Assets ]; then
+            echo "Folder attempt failed, trying the APK file"
+            tail -n 20 ar.log || true
+            rm -rf export
+            start_ar
+            curl -s -o /dev/null -w "load file http %{http_code}\n" --max-time 900 -X POST \
+              --data-urlencode "Path=$PWD/game.apk" http://127.0.0.1:5000/LoadFile
+            export_now
+            pkill -f AssetRipper || true
+          fi
+
+          # attempt 3: only the Data folder
+          if [ ! -d export/ExportedProject/Assets ]; then
+            echo "File attempt failed, trying assets/bin/Data"
+            tail -n 20 ar.log || true
+            rm -rf export
+            start_ar
+            curl -s -o /dev/null -w "load data http %{http_code}\n" --max-time 900 -X POST \
+              --data-urlencode "Path=$PWD/apk/assets/bin/Data" http://127.0.0.1:5000/LoadFolder
+            export_now
+            pkill -f AssetRipper || true
+          fi
+
+          test -d export/ExportedProject/Assets || { echo "ERROR: export failed"; tail -n 60 ar.log; exit 1; }
+          du -sh export
+
+      - name: Show AssetRipper logs
+        if: always()
+        run: |
+          tail -n 40 ar.log || true
+          tail -n 40 ar_stdout.log || true
+
+      - name: Write the report
+        run: |
+          cat > report.py << 'EOF_REPORT'
+          import glob, os, re, json
+
+          proj = "export/ExportedProject"
+          out = []
+          def p(*a):
+              out.append(" ".join(str(x) for x in a))
+
+          def read(path):
+              try:
+                  return open(path, errors="ignore").read()
+              except OSError:
+                  return ""
+
+          p("# APK decompile report\n")
+          p("Unity version:", read("unity_version.txt").strip() or "unknown")
+          p("Architectures in the APK:", ", ".join(sorted(os.listdir("apk/lib"))) if os.path.isdir("apk/lib") else "none")
+          p("Scripting backend:", "IL2CPP" if glob.glob("apk/lib/*/libil2cpp.so") else "Mono")
+          p("")
+
+          ps = read(proj + "/ProjectSettings/ProjectSettings.asset")
+          p("## Player settings (interesting lines)")
+          for key in ["colorSpace", "activeInputHandler", "apiCompatibilityLevel", "scriptingBackend",
+                      "AndroidMinSdkVersion", "AndroidTargetArchitectures", "androidSupportedAspectRatio",
+                      "useHDRDisplay", "m_ShaderPrecisionModel", "gpuSkinning", "graphicsJobs",
+                      "m_BuildTargetGraphicsAPIs", "m_BuildTargetShaderSettings", "vulkanEnableSetSRGBWrite",
+                      "androidBlitType", "preloadedAssets"]:
+              for m in re.finditer(r"^\s*" + key + r".*$", ps, re.M):
+                  p("    " + m.group(0).strip())
+          i = ps.find("m_BuildTargetGraphicsAPIs")
+          if i >= 0:
+              p("    --- graphics API block ---")
+              p("\n".join("    " + l for l in ps[i:i + 700].splitlines()))
+          p("")
+
+          gs = read(proj + "/ProjectSettings/GraphicsSettings.asset")
+          p("## GraphicsSettings (render pipeline + shader settings)")
+          for m in re.finditer(r"^\s*(m_CustomRenderPipeline|m_LightsUseLinearIntensity|m_LightsUseColorTemperature|m_AlwaysIncludedShaders|m_PreloadedShaders|m_VideoShadersIncludeMode|m_LogWhenShaderIsCompiled|m_LightmapStripping|m_FogStripping|m_InstancingStripping).*$", gs, re.M):
+              p("    " + m.group(0).strip())
+          p("")
+
+          qs = read(proj + "/ProjectSettings/QualitySettings.asset")
+          p("## QualitySettings (name + render pipeline per level)")
+          for m in re.finditer(r"^\s*(- serializedVersion|name:|customRenderPipeline:|pixelLightCount:|shadows:|shadowDistance:).*$", qs, re.M):
+              p("    " + m.group(0).strip())
+          p("")
+
+          p("## URP pipeline assets")
+          urp = []
+          for f in glob.glob(proj + "/Assets/**/*.asset", recursive=True):
+              t = read(f)
+              if "m_RendererDataList" in t and "m_SupportsHDR" in t:
+                  urp.append(f)
+                  p("###", f)
+                  for key in ["m_RequireDepthTexture", "m_RequireOpaqueTexture", "m_SupportsHDR", "m_HDRColorBufferPrecision",
+                              "m_MSAA", "m_RenderScale", "m_MainLightRenderingMode", "m_MainLightShadowsSupported",
+                              "m_AdditionalLightsRenderingMode", "m_AdditionalLightsShadowsSupported",
+                              "m_SupportsDynamicBatching", "m_SupportsLightLayers", "m_UseSRPBatcher",
+                              "m_ColorGradingMode", "m_ShaderVariantLogLevel", "m_StoreActionsOptimization",
+                              "m_DefaultRendererIndex", "m_RendererDataList", "k_AssetVersion", "m_VolumeFrameworkUpdateMode"]:
+                      for m in re.finditer(r"^\s*" + key + r".*$", t, re.M):
+                          p("    " + m.group(0).strip())
+                  i = t.find("m_RendererDataList")
+                  if i >= 0:
+                      p("    --- renderer list ---")
+                      p("\n".join("    " + l for l in t[i:i + 200].splitlines()))
+          if not urp:
+              p("(no URP pipeline asset found)")
+          p("")
+
+          p("## Renderer data assets (renderer features)")
+          for f in glob.glob(proj + "/Assets/**/*.asset", recursive=True):
+              t = read(f)
+              if "m_RendererFeatures" in t:
+                  p("###", f)
+                  for key in ["m_Name", "m_RendererFeatures", "m_PostProcessData", "m_Shaders", "m_OpaqueLayerMask",
+                              "m_TransparentLayerMask", "m_DefaultStencilState", "m_ShadowTransparentReceive",
+                              "m_RenderingMode", "m_DepthPrimingMode", "m_CopyDepthMode", "m_AccurateGbufferNormals", "m_IntermediateTextureMode"]:
+                      for m in re.finditer(r"^\s*" + key + r".*$", t, re.M):
+                          p("    " + m.group(0).strip())
+          p("")
+
+          p("## Shaders")
+          shaders = glob.glob(proj + "/Assets/**/*.shader", recursive=True)
+          p("shader files:", len(shaders), " tiny (<2 KB):", sum(1 for s in shaders if os.path.getsize(s) < 2048))
+          rows = []
+          for s in shaders:
+              t = read(s)
+              m = re.search(r'^\s*Shader\s+"([^"]+)"', t, re.M)
+              rows.append((m.group(1) if m else os.path.basename(s), os.path.getsize(s), os.path.relpath(s, proj)))
+          for name, size, path in sorted(rows):
+              p("    %-60s %8d  %s" % (name, size, path))
+          p("")
+
+          p("## Packages (manifest.json)")
+          p(read(proj + "/Packages/manifest.json") or "(none)")
+          p("")
+
+          p("## Plugins and scripts")
+          for f in sorted(glob.glob(proj + "/Assets/Plugins/**/*", recursive=True)):
+              if os.path.isfile(f) and not f.endswith(".meta"):
+                  p("    %-70s %9d" % (os.path.relpath(f, proj), os.path.getsize(f)))
+          sc = glob.glob(proj + "/Assets/Scripts/**/*.cs", recursive=True)
+          p("script files:", len(sc))
+          p("")
+
+          p("## Input actions / Rewired / touch")
+          for f in glob.glob(proj + "/Assets/**/*", recursive=True):
+              low = f.lower()
+              if low.endswith((".inputactions",)) or "rewired" in low and low.endswith(".asset") or "touch" in os.path.basename(low) and low.endswith((".prefab", ".cs")):
+                  p("    " + os.path.relpath(f, proj))
+
+          os.makedirs("out", exist_ok=True)
+          open("out/report.md", "w").write("\n".join(out) + "\n")
+          print("\n".join(out)[:6000])
+          EOF_REPORT
+          python3 report.py
+
+      - name: Pack results
+        run: |
+          mkdir -p pack/settings
+          cp out/report.md pack/
+          # small zip: settings + shaders + URP assets, easy to download on a phone
+          cp -r export/ExportedProject/ProjectSettings pack/settings/ 2>/dev/null || true
+          cp export/ExportedProject/Packages/manifest.json pack/settings/ 2>/dev/null || true
+          (cd export/ExportedProject && find Assets -name "*.shader" -o -name "*.shader.meta" -o -name "*.cginc" -o -name "*.hlsl" -o -name "*.compute" | zip -q ../../pack/shaders.zip -@) || true
+          (cd export/ExportedProject && grep -rlE "m_RendererDataList|m_RendererFeatures" Assets --include=*.asset | zip -q ../../pack/urp-assets.zip -@) || true
+          (cd pack && zip -qr ../apk-settings.zip .)
+          # big zips
+          (cd export && zip -qr ../apk-export.zip .)
+          if [ -d il2cpp_out ]; then
+            (cd il2cpp_out && zip -qr ../apk-il2cpp.zip dump.cs DummyDll script.json stringliteral.json 2>/dev/null) || true
+          fi
+          ls -lh *.zip
+
+      - name: Publish to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="apk-decompile-${{ github.run_number }}"
+          FILES="apk-settings.zip apk-export.zip"
+          [ -f apk-il2cpp.zip ] && FILES="$FILES apk-il2cpp.zip"
+          gh release create "$TAG" $FILES out/report.md \
+            --repo ${{ github.repository }} \
+            --title "APK decompile (run ${{ github.run_number }})" \
+            --notes "Unity $(cat unity_version.txt). report.md has the graphics/URP/shader settings. apk-settings.zip is the small one (settings, shaders, URP assets). apk-export.zip is the full AssetRipper project. apk-il2cpp.zip is the Il2CppDumper class list."
+          echo "Release: https://github.com/${{ github.repository }}/releases/tag/$TAG"
