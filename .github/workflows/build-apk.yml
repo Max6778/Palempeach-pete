@@ -4,12 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       script_mode:
-        description: "How AssetRipper exports the game code"
+        description: "How AssetRipper exports the game code (Auto = Hybrid for baldi_plus, DllExportWithRenaming for family_time)"
         type: choice
-        default: Hybrid
+        default: Auto
         options:
+          - Auto
           - Hybrid
           - Decompiled
+          - DllExportWithRenaming
           - DllExportWithoutRenaming
       shader_mode:
         description: "How AssetRipper exports the game's shaders"
@@ -111,8 +113,9 @@ jobs:
           GAME: ${{ inputs.game }}
           BACKEND: ${{ inputs.scripting_backend }}
           GFX: ${{ inputs.graphics_api }}
+          SMODE: ${{ inputs.script_mode }}
         run: |
-          echo "build-apk.yml version 2026-11-21 (real packages + auto game detection)"
+          echo "build-apk.yml version 2026-11-22 (script mode auto, real packages, game detection)"
           GAME_KEY="$GAME"
           if [ -n "$(find game -maxdepth 3 -name 'FamilyTime_Data' -print -quit)" ]; then
             [ "$GAME" != "family_time" ] && echo "NOTICE: the zip is Family Time, so family_time settings are used even though game=$GAME"
@@ -131,7 +134,13 @@ jobs:
           fi
           if [ "$BACKEND" != "Auto" ]; then SCRIPTING="$BACKEND"; fi
           if [ "$SCRIPTING" = "IL2CPP" ]; then ARCH=ARM64; else ARCH=ARMv7; fi
+          SCRIPT_MODE="$SMODE"
+          if [ "$SCRIPT_MODE" = "Auto" ]; then
+            if [ "$GAME_KEY" = "family_time" ]; then SCRIPT_MODE=DllExportWithRenaming; else SCRIPT_MODE=Hybrid; fi
+          fi
+          echo "script mode: $SCRIPT_MODE"
           {
+            echo "SCRIPT_MODE=$SCRIPT_MODE"
             echo "GAME_KEY=$GAME_KEY"
             echo "UNITY_VER=$UNITY_VER"
             echo "SCRIPTING=$SCRIPTING"
@@ -169,10 +178,10 @@ jobs:
             curl -s http://127.0.0.1:5000 > /dev/null && break
             sleep 2
           done
-          echo "Set script mode: ${{ inputs.script_mode }}"
+          echo "Set script mode: $SCRIPT_MODE"
           echo "Set shader mode: ${{ inputs.shader_mode }}"
           curl -s -o /dev/null -w "settings http %{http_code}\n" -X POST \
-            --data-urlencode "ScriptExportMode=${{ inputs.script_mode }}" \
+            --data-urlencode "ScriptExportMode=$SCRIPT_MODE" \
             --data-urlencode "ShaderExportMode=${{ inputs.shader_mode }}" \
             http://127.0.0.1:5000/Settings/Update
           curl -s -o /dev/null -w "load http %{http_code}\n" --max-time 600 -X POST \
@@ -2854,6 +2863,42 @@ jobs:
                   t2 = t.replace("using Unity.Mathematics;", "using Unity.Mathematics;\n" + "\n".join(add), 1)
                   open(f, "w").write(t2)
                   print("alias added in", os.path.relpath(f, proj), ":", add)
+
+          # ---------------------------------------------------------------- 3. ref/in arguments
+          # The decompiler writes "ref" at call sites of methods that take "in" parameters.
+          # Dropping "ref" is valid for "in" parameters, so do it for the Render Graph and Graphics APIs.
+          REF_CALLS = re.compile(
+              r"\b(UseTexture|UseBuffer|UseRendererList|SetGlobalTextureAfterPass|CreateTransientTexture|CreateTransientBuffer|"
+              r"ImportTexture|ImportBuffer|CreateTexture|CreateBuffer|CreateRendererList|"
+              r"RenderPrimitives|RenderPrimitivesIndexed|RenderPrimitivesIndirect|RenderPrimitivesIndexedIndirect|"
+              r"RenderMeshPrimitives|RenderMesh|RenderMeshInstanced|RenderMeshIndirect)\(ref ")
+          n_ref = 0
+          for f in files:
+              t = read(f)
+              t2, n = REF_CALLS.subn(lambda m: m.group(1) + "(", t)
+              if n:
+                  open(f, "w").write(t2)
+                  n_ref += n
+          print("removed 'ref' from", n_ref, "calls to methods with 'in' parameters")
+
+          # ---------------------------------------------------------------- 4. System vs UnityEngine names
+          CLASHES = [
+              ("Debug", "System.Diagnostics", "UnityEngine.Debug"),
+              ("Object", "System", "UnityEngine.Object"),
+              ("Random", "System", "UnityEngine.Random"),
+          ]
+          for f in files:
+              t = read(f)
+              if "using UnityEngine;" not in t:
+                  continue
+              add = []
+              for name, ns, target in CLASHES:
+                  if ("using %s;" % ns) in t and re.search(r"(?<![\w\.])%s\." % name, t) and ("using %s =" % name) not in t:
+                      add.append("using %s = %s;" % (name, target))
+              if add:
+                  # the alias must not hide an explicit Unity.Mathematics Random: keep it simple and only add what is used
+                  open(f, "w").write(t.replace("using UnityEngine;", "using UnityEngine;\n" + "\n".join(add), 1))
+                  print("alias added in", os.path.relpath(f, proj), ":", add)
           EOF_CSFIX
           python3 csfix_ft.py
 
@@ -3571,7 +3616,14 @@ jobs:
       - name: Show Unity errors
         if: always()
         run: |
-          grep -E "error CS|Shader error|CIBuild:|Build Finished|Error building|BuildFailed|Gradle build failed" unity.log | sort -u | head -n 60 || true
+          echo "--- error codes (count) ---"
+          grep -o "error CS[0-9]*" unity.log | sort | uniq -c | sort -rn || true
+          echo "--- errors (first 150) ---"
+          grep -E "error CS|Shader error|CIBuild:|Build Finished|Error building|BuildFailed|Gradle build failed" unity.log | grep -v "^\[Script Updater\]" | sort -u | head -n 150 || true
+          echo "--- DLLs left in Assets/Plugins ---"
+          ls export/ExportedProject/Assets/Plugins 2>/dev/null | grep "dll$" || true
+          echo "--- package versions in the manifest ---"
+          grep -o '"com.unity[^"]*": "[^"]*"' export/ExportedProject/Packages/manifest.json 2>/dev/null | grep -v modules || true
           tail -n 30 unity.log || true
 
       - name: Publish APK and log to a release
@@ -3579,8 +3631,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          FILES="unity.log"
-          if [ -f apk/game.apk ]; then FILES="apk/game.apk unity.log"; fi
+          cp unity.log unity-log.txt || true
+          FILES="unity-log.txt"
+          if [ -f apk/game.apk ]; then FILES="apk/game.apk unity-log.txt"; fi
           gh release create "build-${{ github.run_number }}" $FILES --repo ${{ github.repository }} --title "Build ${{ github.run_number }}" --notes "Android build"
 
       - name: Upload Unity log
