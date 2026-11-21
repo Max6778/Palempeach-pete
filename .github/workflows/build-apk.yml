@@ -63,6 +63,14 @@ on:
         description: "family_time only: turn off URP Opaque Texture (fixes invisible/black output on some phones)"
         type: boolean
         default: true
+      real_packages:
+        description: "family_time only: swap the game's stripped URP/Core/TextMeshPro/Input System DLLs for the real Unity packages (restores Unity's own shaders)"
+        type: boolean
+        default: true
+      replace_custom_shaders:
+        description: "family_time only: replace the white stand-in shaders with simple textured unlit ones"
+        type: boolean
+        default: true
 
 jobs:
   build:
@@ -75,34 +83,6 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/swift /opt/hostedtoolcache/CodeQL /usr/share/dotnet /usr/local/share/boost
           df -h /
-
-      - name: Resolve game settings
-        env:
-          GAME: ${{ inputs.game }}
-          BACKEND: ${{ inputs.scripting_backend }}
-          GFX: ${{ inputs.graphics_api }}
-        run: |
-          if [ "$GAME" = "family_time" ]; then
-            UNITY_VER=6000.2.12f1
-            SCRIPTING=IL2CPP
-            MIN_SDK=25
-            GRAPHICS_API="$GFX"
-          else
-            UNITY_VER=2020.3.49f1
-            SCRIPTING=Mono
-            MIN_SDK=22
-            GRAPHICS_API=Auto
-          fi
-          if [ "$BACKEND" != "Auto" ]; then SCRIPTING="$BACKEND"; fi
-          if [ "$SCRIPTING" = "IL2CPP" ]; then ARCH=ARM64; else ARCH=ARMv7; fi
-          {
-            echo "UNITY_VER=$UNITY_VER"
-            echo "SCRIPTING=$SCRIPTING"
-            echo "ARCH=$ARCH"
-            echo "MIN_SDK=$MIN_SDK"
-            echo "GRAPHICS_API=$GRAPHICS_API"
-          } >> "$GITHUB_ENV"
-          echo "game=$GAME unity=$UNITY_VER scripting=$SCRIPTING arch=$ARCH minSdk=$MIN_SDK graphicsApi=$GRAPHICS_API"
 
       - name: Download and unzip game
         env:
@@ -125,6 +105,41 @@ jobs:
           gh release download "$TAG" --repo ${{ github.repository }} -p "$ASSET" -O game.zip
           unzip -q game.zip -d game
           test -n "$(find game -name globalgamemanagers | head -n 1)" || { echo "ERROR: game files not found"; exit 1; }
+
+      - name: Resolve game settings
+        env:
+          GAME: ${{ inputs.game }}
+          BACKEND: ${{ inputs.scripting_backend }}
+          GFX: ${{ inputs.graphics_api }}
+        run: |
+          echo "build-apk.yml version 2026-11-21 (real packages + auto game detection)"
+          GAME_KEY="$GAME"
+          if [ -n "$(find game -maxdepth 3 -name 'FamilyTime_Data' -print -quit)" ]; then
+            [ "$GAME" != "family_time" ] && echo "NOTICE: the zip is Family Time, so family_time settings are used even though game=$GAME"
+            GAME_KEY=family_time
+          fi
+          if [ "$GAME_KEY" = "family_time" ]; then
+            UNITY_VER=6000.2.12f1
+            SCRIPTING=IL2CPP
+            MIN_SDK=25
+            GRAPHICS_API="$GFX"
+          else
+            UNITY_VER=2020.3.49f1
+            SCRIPTING=Mono
+            MIN_SDK=22
+            GRAPHICS_API=Auto
+          fi
+          if [ "$BACKEND" != "Auto" ]; then SCRIPTING="$BACKEND"; fi
+          if [ "$SCRIPTING" = "IL2CPP" ]; then ARCH=ARM64; else ARCH=ARMv7; fi
+          {
+            echo "GAME_KEY=$GAME_KEY"
+            echo "UNITY_VER=$UNITY_VER"
+            echo "SCRIPTING=$SCRIPTING"
+            echo "ARCH=$ARCH"
+            echo "MIN_SDK=$MIN_SDK"
+            echo "GRAPHICS_API=$GRAPHICS_API"
+          } >> "$GITHUB_ENV"
+          echo "game=$GAME_KEY unity=$UNITY_VER scripting=$SCRIPTING arch=$ARCH minSdk=$MIN_SDK graphicsApi=$GRAPHICS_API"
 
       - name: Download AssetRipper
         env:
@@ -175,7 +190,7 @@ jobs:
           du -sh export
 
       - name: Inspect original Plus render pipeline before Android patches
-        if: ${{ inputs.game == 'baldi_plus' }}
+        if: ${{ env.GAME_KEY == 'baldi_plus' }}
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -239,7 +254,7 @@ jobs:
           PY
 
       - name: Preserve the original Plus renderer for Android runtime loading
-        if: ${{ inputs.game == 'baldi_plus' }}
+        if: ${{ env.GAME_KEY == 'baldi_plus' }}
         run: |
           ASSETS=export/ExportedProject/Assets
           RENDERER=$(find "$ASSETS" -type f -name "UniversalRenderPipelineAsset_Renderer.asset" | head -n 1)
@@ -270,7 +285,7 @@ jobs:
           password: ${{ secrets.UNITY_PASSWORD }}
 
       - name: Install libssl1.1 for Unity's C# compiler
-        if: ${{ inputs.game == 'baldi_plus' }}
+        if: ${{ env.GAME_KEY == 'baldi_plus' }}
         run: |
           echo "deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://security.ubuntu.com/ubuntu focal-security main" | sudo tee /etc/apt/sources.list.d/focal-security.list
           sudo apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/focal-security.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
@@ -278,7 +293,7 @@ jobs:
           ldconfig -p | grep "libssl.so.1.1" || { echo "ERROR: libssl1.1 not installed"; exit 1; }
 
       - name: Patch game scripts for Android
-        if: ${{ inputs.game == 'baldi_plus' }}
+        if: ${{ env.GAME_KEY == 'baldi_plus' }}
         run: |
           SCRIPTS=$(find export/ExportedProject/Assets -type d -name "Assembly-CSharp" | head -n 1)
           echo "Scripts folder: $SCRIPTS"
@@ -1143,7 +1158,7 @@ jobs:
           python3 patch_map_and_lightmap.py
 
       - name: Patch camera data for Android
-        if: ${{ inputs.game == 'baldi_plus' }}
+        if: ${{ env.GAME_KEY == 'baldi_plus' }}
         run: |
           cat > patch_cameras.py << 'EOF'
           import os, subprocess
@@ -1231,7 +1246,7 @@ jobs:
           python3 patch_cameras.py
 
       - name: Repair Map component for Android
-        if: ${{ inputs.game == 'baldi_plus' }}
+        if: ${{ env.GAME_KEY == 'baldi_plus' }}
         run: |
           cat > patch_map.py << 'EOF_MAP'
           import os, shutil, subprocess
@@ -1430,7 +1445,7 @@ jobs:
           python3 patch_map.py
 
       - name: Patch URP renderer for Android
-        if: ${{ inputs.game == 'baldi_plus' }}
+        if: ${{ env.GAME_KEY == 'baldi_plus' }}
         run: |
           SCRIPTS=$(find export/ExportedProject/Assets -type d -name "Assembly-CSharp" | head -n 1)
           test -n "$SCRIPTS" || { echo "ERROR: scripts folder not found"; exit 1; }
@@ -1742,7 +1757,7 @@ jobs:
           if [ -f "$BLIT" ]; then cp blit.shader "$BLIT"; echo "Replaced the Blit shader"; else echo "WARNING: Blit shader file not found"; fi
 
       - name: Replace stand-in shaders with working ones
-        if: ${{ inputs.game == 'baldi_plus' }}
+        if: ${{ env.GAME_KEY == 'baldi_plus' }}
         run: |
           cat > write_shaders.py << 'EOF_PY'
           import os
@@ -2493,8 +2508,287 @@ jobs:
           EOF_PY
           python3 write_shaders.py
 
+      - name: Use the real Unity packages for Family Time
+        if: ${{ env.GAME_KEY == 'family_time' && inputs.real_packages }}
+        run: |
+          cat > remap_ft.py << 'EOF_REMAP'
+          import io, json, os, re, shutil, sys, tarfile, urllib.request, collections
+
+          proj = os.environ.get("PROJ", "export/ExportedProject")
+          assets = proj + "/Assets"
+          plugins = assets + "/Plugins"
+          WORK = os.environ.get("WORK", "pkgwork")
+
+          # ---------------------------------------------------------------- MD4 (for Unity script file IDs)
+          def _lrot(x, n):
+              return ((x << n) | (x >> (32 - n))) & 0xffffffff
+
+          def md4(data):
+              import struct
+              msg = bytearray(data)
+              ml = len(msg) * 8
+              msg.append(0x80)
+              while len(msg) % 64 != 56:
+                  msg.append(0)
+              msg += struct.pack("<Q", ml)
+              a, b, c, d = 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476
+              F = lambda x, y, z: (x & y) | (~x & z)
+              G = lambda x, y, z: (x & y) | (x & z) | (y & z)
+              H = lambda x, y, z: x ^ y ^ z
+              for off in range(0, len(msg), 64):
+                  X = list(struct.unpack("<16I", msg[off:off + 64]))
+                  aa, bb, cc, dd = a, b, c, d
+                  for i in range(16):
+                      s = [3, 7, 11, 19][i % 4]
+                      t = (a + F(b, c, d) + X[i]) & 0xffffffff
+                      a, b, c, d = d, _lrot(t, s), b, c
+                  for i in range(16):
+                      k = (i % 4) * 4 + i // 4
+                      s = [3, 5, 9, 13][i % 4]
+                      t = (a + G(b, c, d) + X[k] + 0x5a827999) & 0xffffffff
+                      a, b, c, d = d, _lrot(t, s), b, c
+                  order = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15]
+                  for i in range(16):
+                      k = order[i]
+                      s = [3, 9, 11, 15][i % 4]
+                      t = (a + H(b, c, d) + X[k] + 0x6ed9eba1) & 0xffffffff
+                      a, b, c, d = d, _lrot(t, s), b, c
+                  a = (a + aa) & 0xffffffff
+                  b = (b + bb) & 0xffffffff
+                  c = (c + cc) & 0xffffffff
+                  d = (d + dd) & 0xffffffff
+              return struct.pack("<4I", a, b, c, d)
+
+          def file_id(ns, name):
+              h = md4(b"s\0\0\0" + (ns + name).encode())
+              r = 0
+              for i in range(3, -1, -1):
+                  r = (r << 8) | h[i]
+              if r >= 2 ** 31:
+                  r -= 2 ** 32
+              return r
+
+          # ---------------------------------------------------------------- download packages
+          PACKAGES = [
+              ("com.unity.render-pipelines.core", "17.2.0"),
+              ("com.unity.render-pipelines.universal", "17.2.0"),
+              ("com.unity.visualeffectgraph", "17.2.0"),
+              ("com.unity.ugui", "2.0.0"),
+              ("com.unity.inputsystem", "1.14.0"),
+          ]
+
+          def download(name, ver, dest):
+              url = None
+              try:
+                  req = urllib.request.Request("https://packages.unity.com/" + name, headers={"Accept": "application/json"})
+                  data = json.load(urllib.request.urlopen(req, timeout=60))
+                  url = data["versions"][ver]["dist"]["tarball"]
+              except Exception as e:
+                  print("  registry lookup failed:", e)
+              urls = [u for u in [url, "https://download.packages.unity.com/%s/-/%s-%s.tgz" % (name, name, ver)] if u]
+              for u in urls:
+                  try:
+                      raw = urllib.request.urlopen(u, timeout=300).read()
+                      tf = tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz")
+                      os.makedirs(dest, exist_ok=True)
+                      n = 0
+                      for m in tf.getmembers():
+                          if not m.isfile():
+                              continue
+                          parts = m.name.split("/")[1:]
+                          if not parts or ".." in parts or m.name.startswith("/"):
+                              continue
+                          out = os.path.join(dest, *parts)
+                          os.makedirs(os.path.dirname(out), exist_ok=True)
+                          with open(out, "wb") as f:
+                              f.write(tf.extractfile(m).read())
+                          n += 1
+                      print("  downloaded", name, ver, "(", n, "files ) from", u)
+                      return True
+                  except Exception as e:
+                      print("  download failed from", u, ":", e)
+              return False
+
+          def guid_of(meta_path):
+              try:
+                  for line in open(meta_path, errors="ignore"):
+                      if line.startswith("guid:"):
+                          return line.split(":", 1)[1].strip()
+              except OSError:
+                  pass
+              return None
+
+          # ---------------------------------------------------------------- scan package sources
+          def strip_comments(t):
+              t = re.sub(r"/\*.*?\*/", "", t, flags=re.S)
+              return re.sub(r"//[^\n]*", "", t)
+
+          def scan(pkg_dirs):
+              asm_scripts = collections.defaultdict(dict)   # assembly -> {(ns, cls): guid}
+              shaders = {}                                    # shader name -> guid
+              computes = {}                                   # compute name -> guid
+              for pdir in pkg_dirs:
+                  asmdirs = {}
+                  for root, dirs, files in os.walk(pdir):
+                      for f in files:
+                          if f.endswith(".asmdef"):
+                              try:
+                                  asmdirs[root] = json.load(open(os.path.join(root, f), errors="ignore"))["name"]
+                              except Exception:
+                                  pass
+                  for root, dirs, files in os.walk(pdir):
+                      for f in files:
+                          path = os.path.join(root, f)
+                          g = guid_of(path + ".meta")
+                          if not g:
+                              continue
+                          if f.endswith(".cs"):
+                              d = root
+                              asm = None
+                              while d.startswith(pdir):
+                                  if d in asmdirs:
+                                      asm = asmdirs[d]
+                                      break
+                                  if d == pdir:
+                                      break
+                                  d = os.path.dirname(d)
+                              if not asm:
+                                  continue
+                              stem = f[:-3]
+                              text = strip_comments(open(path, errors="ignore").read())
+                              cm = re.search(r"\bclass\s+" + re.escape(stem) + r"\b", text)
+                              if not cm:
+                                  continue
+                              ns = ""
+                              for nm in re.finditer(r"^\s*namespace\s+([\w\.]+)", text[:cm.start()], re.M):
+                                  ns = nm.group(1)
+                              asm_scripts[asm][(ns, stem)] = g
+                          elif f.endswith(".shader"):
+                              m = re.search(r'^\s*Shader\s+"([^"]+)"', open(path, errors="ignore").read(), re.M)
+                              if m:
+                                  shaders[m.group(1)] = g
+                          elif f.endswith(".compute"):
+                              computes[f[:-8]] = g
+              return asm_scripts, shaders, computes
+
+          def yaml_files():
+              for root, dirs, files in os.walk(assets):
+                  for f in files:
+                      if f.endswith((".asset", ".prefab", ".unity", ".mat", ".controller", ".anim", ".overrideController", ".playable", ".mask", ".flare", ".preset")):
+                          yield os.path.join(root, f)
+
+          REF = re.compile(r"\{fileID: (-?\d+), guid: ([0-9a-f]{32}), type: (\d)\}")
+
+          def process(pkg_dirs):
+              asm_scripts, pkg_shaders, pkg_computes = scan(pkg_dirs)
+              print("package scan: assemblies", len(asm_scripts), "shaders", len(pkg_shaders), "compute", len(pkg_computes))
+
+              # stripped DLLs that a package now provides
+              script_map = {}      # (dll guid, fileID) -> package script guid
+              dll_guid_to_name = {}
+              removable = []
+              for dll in sorted(os.listdir(plugins)) if os.path.isdir(plugins) else []:
+                  if not dll.endswith(".dll"):
+                      continue
+                  asm = dll[:-4]
+                  if asm not in asm_scripts:
+                      continue
+                  g = guid_of(os.path.join(plugins, dll + ".meta"))
+                  if not g:
+                      continue
+                  dll_guid_to_name[g] = asm
+                  removable.append(dll)
+                  for (ns, cls), pg in asm_scripts[asm].items():
+                      script_map[(g, file_id(ns, cls))] = pg
+                  print("  replace", asm, "->", len(asm_scripts[asm]), "scripts")
+
+              # stub shaders / computes that a package now provides
+              shader_map = {}
+              stub_files = []
+              for f in os.listdir(assets + "/Shader") if os.path.isdir(assets + "/Shader") else []:
+                  if not f.endswith(".shader"):
+                      continue
+                  path = assets + "/Shader/" + f
+                  m = re.search(r'^\s*Shader\s+"([^"]+)"', open(path, errors="ignore").read(), re.M)
+                  g = guid_of(path + ".meta")
+                  if m and g and m.group(1) in pkg_shaders:
+                      shader_map[g] = pkg_shaders[m.group(1)]
+                      stub_files.append(path)
+              compute_map = {}
+              for f in os.listdir(assets + "/ComputeShader") if os.path.isdir(assets + "/ComputeShader") else []:
+                  if not f.endswith(".asset"):
+                      continue
+                  stem = f[:-6]
+                  path = assets + "/ComputeShader/" + f
+                  g = guid_of(path + ".meta")
+                  if g and stem in pkg_computes:
+                      compute_map[g] = pkg_computes[stem]
+                      stub_files.append(path)
+              print("  stub shaders replaced by package shaders:", len(shader_map), " compute:", len(compute_map))
+
+              unmapped = collections.Counter()
+              changed = 0
+              for path in yaml_files():
+                  try:
+                      t = open(path, errors="ignore").read()
+                  except OSError:
+                      continue
+                  if "guid:" not in t:
+                      continue
+                  def sub(m):
+                      fid, g, typ = m.group(1), m.group(2), m.group(3)
+                      if g in dll_guid_to_name:
+                          new = script_map.get((g, int(fid)))
+                          if new:
+                              return "{fileID: 11500000, guid: %s, type: 3}" % new
+                          unmapped[(dll_guid_to_name[g], fid)] += 1
+                          return m.group(0)
+                      if g in shader_map:
+                          return "{fileID: %s, guid: %s, type: %s}" % (fid, shader_map[g], typ)
+                      if g in compute_map:
+                          return "{fileID: %s, guid: %s, type: %s}" % (fid, compute_map[g], typ)
+                      return m.group(0)
+                  t2 = REF.sub(sub, t)
+                  if t2 != t:
+                      open(path, "w").write(t2)
+                      changed += 1
+              print("  rewrote references in", changed, "files")
+              if unmapped:
+                  print("  WARNING: references that could not be mapped (class not found in package):")
+                  for k, v in unmapped.most_common(15):
+                      print("    ", k, "x", v)
+
+              # remove the stripped DLLs and the stub files that are now provided by packages
+              for dll in removable:
+                  for ext in ("", ".meta"):
+                      p = os.path.join(plugins, dll + ext)
+                      if os.path.exists(p):
+                          os.remove(p)
+              for p in stub_files:
+                  for ext in ("", ".meta"):
+                      if os.path.exists(p + ext):
+                          os.remove(p + ext)
+              print("  removed", len(removable), "stripped DLLs and", len(stub_files), "stub files")
+              return len(removable)
+
+          if __name__ == "__main__":
+              dirs = []
+              for name, ver in PACKAGES:
+                  print("package", name, ver)
+                  d = os.path.join(WORK, name)
+                  if download(name, ver, d):
+                      dirs.append(d)
+                  else:
+                      print("  FAILED - keeping the game's own copy for this package")
+              if not dirs:
+                  print("No packages downloaded; nothing changed.")
+                  sys.exit(0)
+              process(dirs)
+          EOF_REMAP
+          python3 remap_ft.py
+
       - name: Fix packages and settings for Family Time
-        if: ${{ inputs.game == 'family_time' }}
+        if: ${{ env.GAME_KEY == 'family_time' }}
         env:
           URP_SAFE: ${{ inputs.urp_safe_settings }}
         run: |
@@ -2507,6 +2801,31 @@ jobs:
           manifest = json.load(open(mpath)) if os.path.exists(mpath) else {"dependencies": {}}
           deps = manifest.setdefault("dependencies", {})
           print("Packages before:", json.dumps(deps, indent=1))
+
+          # ---- the game ships stripped copies of these libraries; use the real packages instead
+          for dll in ["Unity.Collections", "Unity.Burst", "Unity.Burst.Unsafe", "Unity.Mathematics"]:
+              for ext in ["", ".meta"]:
+                  fp = proj + "/Assets/Plugins/" + dll + ".dll" + ext
+                  if os.path.exists(fp):
+                      os.remove(fp)
+                      print("removed stripped plugin:", fp)
+
+          # ---- decompiler dropped operator != next to operator == (C# requires both)
+          pat = re.compile(r"^(\s*)public static bool operator ==\((\S+) (\w+), (\S+) (\w+)\)\s*\n\1\{.*?\n\1\}", re.M | re.S)
+          for f in glob.glob(proj + "/Assets/Scripts/**/*.cs", recursive=True):
+              t = open(f, errors="ignore").read()
+              if "operator ==" not in t:
+                  continue
+              def fix(m):
+                  rest = t
+                  ind, ta, a, tb, b = m.groups()
+                  if ("operator !=(" + ta + " ") in rest:
+                      return m.group(0)
+                  print("adding operator != in", f, "for", ta)
+                  return m.group(0) + "\n\n" + ind + "public static bool operator !=(" + ta + " " + a + ", " + tb + " " + b + ")\n" + ind + "{\n" + ind + "\treturn !(" + a + " == " + b + ");\n" + ind + "}"
+              t2 = pat.sub(fix, t)
+              if t2 != t:
+                  open(f, "w").write(t2)
 
           # ---- which assemblies does the export already contain (to avoid duplicates with packages)
           existing = set()
@@ -2566,8 +2885,8 @@ jobs:
               return fallback
 
           add("com.unity.mathematics", pick("com.unity.mathematics", "1.3.2"), ["Unity.Mathematics"])
-          add("com.unity.burst", pick("com.unity.burst", None), ["Unity.Burst"])
-          add("com.unity.collections", pick("com.unity.collections", None), ["Unity.Collections"])
+          add("com.unity.burst", pick("com.unity.burst", "1.8.19"), ["Unity.Burst"])
+          add("com.unity.collections", pick("com.unity.collections", "2.5.7"), ["Unity.Collections"])
 
           # ---- built-in modules: only add the ones this editor really ships
           def find_builtin():
@@ -2653,8 +2972,147 @@ jobs:
           EOF_FT
           python3 fix_ft.py
 
+      - name: Replace stand-in shaders for Family Time
+        if: ${{ env.GAME_KEY == 'family_time' && inputs.replace_custom_shaders }}
+        run: |
+          cat > shaders_ft.py << 'EOF_SHADERS'
+          import os, re
+
+          proj = os.environ.get("PROJ", "export/ExportedProject")
+          sdir = proj + "/Assets/Shader"
+
+          CUTOUT = re.compile(r"Impostor|Leaf|Billboard|Tree|Grass|Foliage|Dropoff", re.I)
+          TRANSP = re.compile(r"Water|Particle|Rain|Cloud|Overlay|Preview|Behind|Rim|Pointer|Glass|Fade|Fog|Weather|Decal|Stencil|Block|Outline", re.I)
+          BAD_TEX = re.compile(r"normal|noise|mask|bump|flow|depth|occlusion|metal|emission|height|lut", re.I)
+
+          SKIP = re.compile(r"Hidden/(Universal|Core|CoreSRP|TerrainEngine|Shader Graph|kMotion|VFX)|TextMeshPro/")
+
+          PROP = re.compile(r'^\s*(?:\[[^\]]*\]\s*)*(\w+)\s*\(\s*"[^"]*"\s*,\s*([A-Za-z0-9]+)(?:\([^)]*\))?\s*\)', re.M)
+
+          def props_of(block):
+              return [(m.group(1), m.group(2)) for m in PROP.finditer(block)]
+
+          def pick_tex(props):
+              twod = [n for n, t in props if t == "2D"]
+              for pref in ("_BaseMap", "_MainTex", "_BaseColorMap", "_Albedo", "_Diffuse"):
+                  if pref in twod:
+                      return pref
+              for n in twod:
+                  if not BAD_TEX.search(n):
+                      return n
+              return None
+
+          def pick_color(props):
+              vec = [n for n, t in props if t in ("Vector", "Color")]
+              for pref in ("_BaseColor", "_Color", "_TintColor", "_MainColor"):
+                  if pref in vec:
+                      return pref
+              for n in vec:
+                  if re.search("color|tint", n, re.I):
+                      return n
+              return None
+
+          def make(name, props_block, props):
+              tex = pick_tex(props)
+              col = pick_color(props)
+              is_hidden = name.startswith("Hidden/")
+              is_sky = "skybox" in name.lower()
+              is_ui = name.startswith("UI/")
+              transp = bool(TRANSP.search(name)) or is_ui
+              cutout = bool(CUTOUT.search(name)) and not transp
+              has_cull = any(n == "_Cull" for n, t in props)
+
+              decl = ""
+              if tex:
+                  decl += "\t\t\tTexture2D %s;\n\t\t\tSamplerState sampler%s;\n\t\t\tfloat4 %s_ST;\n" % (tex, tex, tex)
+              if col:
+                  decl += "\t\t\tfloat4 %s;\n" % col
+
+              if is_hidden:
+                  # custom full-screen/utility shader that cannot be recovered: draw nothing
+                  body = "\t\t\t\tclip(-1.0);\n\t\t\t\treturn float4(0.0, 0.0, 0.0, 0.0);\n"
+              elif is_sky:
+                  c = ("%s.rgb" % col) if col else "float3(0.45, 0.62, 0.90)"
+                  body = "\t\t\t\treturn float4(%s, 1.0);\n" % c
+              else:
+                  body = "\t\t\t\tfloat4 c = float4(1.0, 1.0, 1.0, 1.0);\n"
+                  if tex:
+                      body += "\t\t\t\tc = %s.Sample(sampler%s, i.uv);\n" % (tex, tex)
+                  if col:
+                      body += "\t\t\t\tc *= %s;\n" % col
+                  if is_ui:
+                      body += "\t\t\t\tc *= i.color;\n"
+                  if cutout:
+                      body += "\t\t\t\tclip(c.a - 0.5);\n"
+                  if not transp:
+                      body += "\t\t\t\tc.a = 1.0;\n" if not cutout else ""
+                  body += "\t\t\t\treturn c;\n"
+
+              uv_line = "o.uv = i.uv;" if not tex else "o.uv = i.uv * %s_ST.xy + %s_ST.zw;" % (tex, tex)
+              if transp:
+                  tags = '"RenderType"="Transparent" "Queue"="Transparent"'
+                  state = "\t\t\tBlend SrcAlpha OneMinusSrcAlpha\n\t\t\tZWrite Off\n"
+              elif is_sky:
+                  tags = '"RenderType"="Background" "Queue"="Background" "PreviewType"="Skybox"'
+                  state = "\t\t\tZWrite Off\n\t\t\tCull Off\n"
+              elif cutout:
+                  tags = '"RenderType"="TransparentCutout" "Queue"="AlphaTest"'
+                  state = ""
+              else:
+                  tags = '"RenderType"="Opaque" "Queue"="Geometry"'
+                  state = ""
+              if is_ui:
+                  state += "\t\t\tCull Off\n\t\t\tZTest [unity_GUIZTestMode]\n"
+              elif not is_sky:
+                  state += ("\t\t\tCull [_Cull]\n" if has_cull else "\t\t\tCull Off\n")
+
+              return (
+                  'Shader "%s" {\n%s\n'
+                  "\t//AndroidPortUnlitStandIn\n"
+                  "\tSubShader {\n\t\tTags { %s }\n\t\tLOD 100\n\n\t\tPass {\n\t\t\tName \"Unlit\"\n\t\t\tTags { \"LightMode\"=\"UniversalForward\" }\n"
+                  "%s\n\t\t\tHLSLPROGRAM\n\t\t\t#pragma vertex vert\n\t\t\t#pragma fragment frag\n\n"
+                  "\t\t\tfloat4x4 unity_ObjectToWorld;\n\t\t\tfloat4x4 unity_MatrixVP;\n%s\n"
+                  "\t\t\tstruct Attributes { float4 pos : POSITION; float2 uv : TEXCOORD0; float4 color : COLOR; };\n"
+                  "\t\t\tstruct Varyings { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 color : COLOR; };\n\n"
+                  "\t\t\tVaryings vert(Attributes i)\n\t\t\t{\n\t\t\t\tVaryings o;\n"
+                  "\t\t\t\to.pos = mul(unity_MatrixVP, mul(unity_ObjectToWorld, i.pos));\n"
+                  "\t\t\t\t%s\n\t\t\t\to.color = i.color;\n\t\t\t\treturn o;\n\t\t\t}\n\n"
+                  "\t\t\tfloat4 frag(Varyings i) : SV_Target\n\t\t\t{\n%s\t\t\t}\n\n"
+                  "\t\t\tENDHLSL\n\t\t}\n\t}\n}\n"
+              ) % (name, props_block, tags, state, decl, uv_line, body)
+
+          def main():
+              n = 0
+              hidden = 0
+              for f in sorted(os.listdir(sdir)) if os.path.isdir(sdir) else []:
+                  if not f.endswith(".shader"):
+                      continue
+                  path = os.path.join(sdir, f)
+                  t = open(path, errors="ignore").read()
+                  if "DummyShaderTextExporter" not in t:
+                      continue
+                  m = re.search(r'^\s*Shader\s+"([^"]+)"', t, re.M)
+                  pm = re.search(r"Properties\s*\{.*?\n\t\}", t, re.S)
+                  if not m or not pm:
+                      continue
+                  name = m.group(1)
+                  if SKIP.match(name):
+                      continue
+                  block = pm.group(0)
+                  out = make(name, block, props_of(block))
+                  open(path, "w").write(out)
+                  n += 1
+                  if name.startswith("Hidden/"):
+                      hidden += 1
+              print("replaced", n, "stand-in shaders with simple unlit ones (", hidden, "hidden utility shaders draw nothing )")
+
+          if __name__ == "__main__":
+              main()
+          EOF_SHADERS
+          python3 shaders_ft.py
+
       - name: Add touch controls for Family Time
-        if: ${{ inputs.game == 'family_time' }}
+        if: ${{ env.GAME_KEY == 'family_time' }}
         env:
           TOUCH_MODE: ${{ inputs.touch_mode }}
         run: |
@@ -2843,25 +3301,25 @@ jobs:
           		}
           		if (usePad && pad != null)
           		{
-          			GamepadState gs = new GamepadState();
-          			gs.leftStick = joyVec;
-          			gs.rightStick = Vector2.ClampMagnitude(lookDelta * LookPadScale, 1f);
-          			foreach (Btn b in held) gs = gs.WithButton(b.pad);
-          			InputSystem.QueueStateEvent(pad, gs);
+          			InputState.Change(pad.leftStick, joyVec);
+          			InputState.Change(pad.rightStick, Vector2.ClampMagnitude(lookDelta * LookPadScale, 1f));
+          			for (int i = 0; i < buttons.Count; i++)
+          			{
+          				InputState.Change(pad[buttons[i].pad], held.Contains(buttons[i]) ? 1f : 0f);
+          			}
           		}
           		if (useKb && kb != null && mouse != null)
           		{
-          			List<Key> keys = new List<Key>();
-          			if (joyVec.y > 0.35f) keys.Add(Key.W);
-          			if (joyVec.y < -0.35f) keys.Add(Key.S);
-          			if (joyVec.x > 0.35f) keys.Add(Key.D);
-          			if (joyVec.x < -0.35f) keys.Add(Key.A);
-          			foreach (Btn b in held) keys.Add(b.key);
-          			InputSystem.QueueStateEvent(kb, new KeyboardState(keys.ToArray()));
-          			MouseState ms = new MouseState();
-          			ms.position = new Vector2(Screen.width / 2f, Screen.height / 2f);
-          			ms.delta = lookDelta * LookMouseScale;
-          			InputSystem.QueueStateEvent(mouse, ms);
+          			InputState.Change(kb[Key.W], joyVec.y > 0.35f ? 1f : 0f);
+          			InputState.Change(kb[Key.S], joyVec.y < -0.35f ? 1f : 0f);
+          			InputState.Change(kb[Key.D], joyVec.x > 0.35f ? 1f : 0f);
+          			InputState.Change(kb[Key.A], joyVec.x < -0.35f ? 1f : 0f);
+          			for (int i = 0; i < buttons.Count; i++)
+          			{
+          				InputState.Change(kb[buttons[i].key], held.Contains(buttons[i]) ? 1f : 0f);
+          			}
+          			InputState.Change(mouse.position, new Vector2(Screen.width / 2f, Screen.height / 2f));
+          			InputState.Change(mouse.delta, lookDelta * LookMouseScale);
           		}
           	}
 
