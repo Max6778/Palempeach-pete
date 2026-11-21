@@ -2787,6 +2787,76 @@ jobs:
           EOF_REMAP
           python3 remap_ft.py
 
+      - name: Fix decompiled code for Family Time
+        if: ${{ env.GAME_KEY == 'family_time' }}
+        run: |
+          cat > csfix_ft.py << 'EOF_CSFIX'
+          import glob, os, re
+
+          proj = os.environ.get("PROJ", "export/ExportedProject")
+          files = glob.glob(proj + "/Assets/Scripts/**/*.cs", recursive=True)
+
+          def read(f):
+              return open(f, errors="ignore").read()
+
+          # ---------------------------------------------------------------- 1. Input actions wrapper
+          # The decompiler drops some members the real Input System interface needs.
+          DEV = re.compile(r"public ReadOnlyArray<InputDevice>\? devices\s*\{\s*set\s*\{\s*asset\.devices = value;\s*\}\s*\}")
+          NEW_MEMBERS = (
+              "public InputBinding? bindingMask\n"
+              "\t{\n\t\tget { return asset.bindingMask; }\n\t\tset { asset.bindingMask = value; }\n\t}\n\n"
+              "\tpublic ReadOnlyArray<InputDevice>? devices\n"
+              "\t{\n\t\tget { return asset.devices; }\n\t\tset { asset.devices = value; }\n\t}\n\n"
+              "\tpublic ReadOnlyArray<InputControlScheme> controlSchemes { get { return asset.controlSchemes; } }\n\n"
+              "\tpublic bool Contains(InputAction action) { return asset.Contains(action); }\n\n"
+              "\tpublic void Enable() { asset.Enable(); }\n\n"
+              "\tpublic void Disable() { asset.Disable(); }"
+          )
+          for f in files:
+              t = read(f)
+              if "IInputActionCollection" not in t or "Contains(InputAction" in t:
+                  continue
+              if DEV.search(t):
+                  open(f, "w").write(DEV.sub(lambda m: NEW_MEMBERS, t, count=1))
+                  print("added missing Input System interface members in", f)
+              else:
+                  print("WARNING: could not patch", f, "(devices block not found)")
+
+          # ---------------------------------------------------------------- 2. Names that exist in the game AND in Unity.Mathematics
+          MATH_NAMES = re.compile(r"^(RigidTransform|MinMaxAABB|AffineTransform|Random|noise|math|quaternion|(half|float|int|uint|bool|double)[234](x[234])?)$")
+          declared = {}  # name -> namespace
+          for f in files:
+              t = read(f)
+              for m in re.finditer(r"^\s*(?:public |internal )?(?:sealed |static |abstract |partial |readonly |unsafe )*(?:class|struct|enum|interface)\s+(\w+)", t, re.M):
+                  name = m.group(1)
+                  if not MATH_NAMES.match(name):
+                      continue
+                  if os.path.splitext(os.path.basename(f))[0] != name:
+                      continue
+                  ns = ""
+                  for nm in re.finditer(r"^\s*namespace\s+([\w\.]+)", t[:m.start()], re.M):
+                      ns = nm.group(1)
+                  declared[name] = ns
+          print("game types that clash with Unity.Mathematics names:", declared)
+
+          for f in files:
+              t = read(f)
+              if "using Unity.Mathematics;" not in t:
+                  continue
+              stem = os.path.splitext(os.path.basename(f))[0]
+              add = []
+              for name, ns in declared.items():
+                  if stem == name or not ns:
+                      continue
+                  if ("using %s;" % ns) in t and re.search(r"\b%s\b" % name, t) and ("using %s =" % name) not in t:
+                      add.append("using %s = %s.%s;" % (name, ns, name))
+              if add:
+                  t2 = t.replace("using Unity.Mathematics;", "using Unity.Mathematics;\n" + "\n".join(add), 1)
+                  open(f, "w").write(t2)
+                  print("alias added in", os.path.relpath(f, proj), ":", add)
+          EOF_CSFIX
+          python3 csfix_ft.py
+
       - name: Fix packages and settings for Family Time
         if: ${{ env.GAME_KEY == 'family_time' }}
         env:
