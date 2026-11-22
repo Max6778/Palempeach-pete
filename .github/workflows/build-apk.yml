@@ -3272,31 +3272,38 @@ jobs:
           mkdir -p "$EMBEDDED"
           cp -a "$PACKAGE/." "$EMBEDDED/"
           python3 - <<'PY_PATCH'
+          import re
           from pathlib import Path
 
           path = Path("export/ExportedProject/Packages/com.unity.inputsystem/InputSystem/Editor/BuildPipeline/LinkFileGenerator.cs")
           text = path.read_text()
-          old = """            foreach (var property in type.GetProperties())
-                if (IsPropertyRelatedToControlLayouts(property))
-                    return true;
-          """
-          new = """            try
-            {
-                foreach (var property in type.GetProperties())
-                    if (IsPropertyRelatedToControlLayouts(property))
-                        return true;
-            }
-            catch (TypeLoadException e)
-            {
-                // Older game assemblies can implement an outdated Input System interface. Keep
-                // this reflection-only type out of the preservation scan; Unity's linker still
-                // follows its ordinary static and serialized references.
-                UnityEngine.Debug.LogWarning($"Skipping Input System reflection scan for {type.FullName}: {e.Message}");
-            }
-          """
-          if old not in text:
-              raise SystemExit("Could not find the expected Input System reflection block")
-          path.write_text(text.replace(old, new, 1))
+          pattern = re.compile(
+              r"(?m)^([ \t]*)foreach \(var property in type\.GetProperties\(\)\)\r?\n"
+              r"[ \t]*if \(IsPropertyRelatedToControlLayouts\(property\)\)\r?\n"
+              r"[ \t]*return true;"
+          )
+
+          def guard_property_scan(match):
+              indent = match.group(1)
+              inner = indent + "    "
+              return "\n".join((
+                  indent + "try",
+                  indent + "{",
+                  inner + "foreach (var property in type.GetProperties())",
+                  inner + "    if (IsPropertyRelatedToControlLayouts(property))",
+                  inner + "        return true;",
+                  indent + "}",
+                  indent + "catch (TypeLoadException e)",
+                  indent + "{",
+                  inner + "// Ignore legacy game types that cannot be reflected against this Input System version.",
+                  inner + 'UnityEngine.Debug.LogWarning($"Skipping Input System reflection scan for {type.FullName}: {e.Message}");',
+                  indent + "}",
+              ))
+
+          text, count = pattern.subn(guard_property_scan, text, count=1)
+          if count != 1:
+              raise SystemExit("Could not find the Input System property reflection block")
+          path.write_text(text)
           print("Guarded Input System property reflection for legacy UserInput types")
           PY_PATCH
 
@@ -3877,7 +3884,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp unity.log unity-log.txt || true
+          if [ ! -f unity.log ]; then
+            echo "No Unity log exists because an earlier setup step stopped before Unity launched."
+            exit 0
+          fi
+          cp unity.log unity-log.txt
           FILES="unity-log.txt"
           if [ -f apk/game.apk ]; then FILES="apk/game.apk unity-log.txt"; fi
           gh release create "build-${{ github.run_number }}" $FILES --repo ${{ github.repository }} --title "Build ${{ github.run_number }}" --notes "Android build"
