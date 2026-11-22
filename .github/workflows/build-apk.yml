@@ -3262,6 +3262,44 @@ jobs:
           EOF_FT
           python3 fix_ft.py
 
+      - name: Guard Input System linker against the game's legacy UserInput type
+        if: ${{ env.GAME_KEY == 'family_time' && inputs.real_packages }}
+        run: |
+          set -euo pipefail
+          PACKAGE=$(find "$PKG_CACHE" -mindepth 1 -maxdepth 1 -type d -name 'com.unity.inputsystem@*' -print -quit)
+          test -n "$PACKAGE" || { echo "Input System package was not found in $PKG_CACHE"; exit 1; }
+          EMBEDDED="export/ExportedProject/Packages/com.unity.inputsystem"
+          mkdir -p "$EMBEDDED"
+          cp -a "$PACKAGE/." "$EMBEDDED/"
+          python3 - <<'PY_PATCH'
+          from pathlib import Path
+
+          path = Path("export/ExportedProject/Packages/com.unity.inputsystem/InputSystem/Editor/BuildPipeline/LinkFileGenerator.cs")
+          text = path.read_text()
+          old = """            foreach (var property in type.GetProperties())
+                if (IsPropertyRelatedToControlLayouts(property))
+                    return true;
+          """
+          new = """            try
+            {
+                foreach (var property in type.GetProperties())
+                    if (IsPropertyRelatedToControlLayouts(property))
+                        return true;
+            }
+            catch (TypeLoadException e)
+            {
+                // Older game assemblies can implement an outdated Input System interface. Keep
+                // this reflection-only type out of the preservation scan; Unity's linker still
+                // follows its ordinary static and serialized references.
+                UnityEngine.Debug.LogWarning($"Skipping Input System reflection scan for {type.FullName}: {e.Message}");
+            }
+          """
+          if old not in text:
+              raise SystemExit("Could not find the expected Input System reflection block")
+          path.write_text(text.replace(old, new, 1))
+          print("Guarded Input System property reflection for legacy UserInput types")
+          PY_PATCH
+
       - name: Replace stand-in shaders for Family Time
         if: ${{ env.GAME_KEY == 'family_time' && inputs.replace_custom_shaders }}
         run: |
