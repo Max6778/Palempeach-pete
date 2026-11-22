@@ -1,0 +1,199 @@
+name: Build Box3D for Android (libbox3d.so)
+
+# The game calls a native physics library, box3d.dll, 88 times. Android needs libbox3d.so.
+# Box3D (Erin Catto, MIT license) is plain C, so this builds it with the Android NDK.
+# It tries several Box3D versions and compares each one with the functions the game really
+# calls, then publishes the best match as a release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      refs:
+        description: "Box3D versions to try (tags, branches or commit ids), separated by spaces"
+        required: true
+        default: "v0.1.0 main"
+      game_tag:
+        description: "Release tag that holds the Family Time zip"
+        required: true
+        default: game2
+      game_asset:
+        description: "Family Time zip file name (any .zip in the release is used if this is not found)"
+        required: true
+        default: Family_Time_Ep_3_WINDOWS_DX11_b108.zip
+      api_level:
+        description: "Android API level"
+        required: true
+        default: "25"
+
+permissions:
+  contents: write
+
+jobs:
+  box3d:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Get the game's box3d.dll and Box3d.Runtime.dll
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.game_tag }}
+          ASSET: ${{ inputs.game_asset }}
+        run: |
+          OK=0
+          for T in "$TAG" game2 familytime; do
+            echo "Trying release $T"
+            if gh release download "$T" --repo ${{ github.repository }} -p "$ASSET" -O game.zip 2>/dev/null; then OK=1; break; fi
+            if gh release download "$T" --repo ${{ github.repository }} -p "*.zip" -O game.zip 2>/dev/null; then OK=1; break; fi
+          done
+          [ "$OK" = 1 ] || { echo "ERROR: could not download the game zip. Releases:"; gh release list --repo ${{ github.repository }}; exit 1; }
+          unzip -l game.zip | grep -iE "box3d" || true
+          mkdir game
+          unzip -oj game.zip '*/Plugins/x86_64/box3d.dll' '*/Managed/Box3d.Runtime.dll' -d game
+          ls -l game
+
+      - name: Write the comparison script
+        run: |
+          cat > compare_b3.py << 'EOF_CMP'
+          import re, struct, subprocess, sys
+
+          def pe_exports(path):
+              d = open(path, "rb").read()
+              pe = struct.unpack_from("<I", d, 0x3C)[0]
+              assert d[pe:pe + 4] == b"PE\0\0", "not a PE file"
+              nsec = struct.unpack_from("<H", d, pe + 6)[0]
+              optsize = struct.unpack_from("<H", d, pe + 20)[0]
+              opt = pe + 24
+              magic = struct.unpack_from("<H", d, opt)[0]
+              dd = opt + (112 if magic == 0x20B else 96)
+              exp_rva, exp_size = struct.unpack_from("<II", d, dd)
+              secs = []
+              s = opt + optsize
+              for i in range(nsec):
+                  vsize, va, rawsize, raw = struct.unpack_from("<IIII", d, s + 8 + i * 40)
+                  secs.append((va, max(vsize, rawsize), raw))
+              def off(rva):
+                  for va, size, raw in secs:
+                      if va <= rva < va + size:
+                          return rva - va + raw
+                  raise ValueError("bad rva")
+              if not exp_rva:
+                  return set()
+              e = off(exp_rva)
+              nnames, = struct.unpack_from("<I", d, e + 24)
+              names_rva, = struct.unpack_from("<I", d, e + 32)
+              names = set()
+              for i in range(nnames):
+                  nrva, = struct.unpack_from("<I", d, off(names_rva) + 4 * i)
+                  o = off(nrva)
+                  names.add(d[o:d.index(b"\0", o)].decode())
+              return names
+
+          def so_exports(path):
+              out = subprocess.run(["nm", "-D", "--defined-only", path], capture_output=True, text=True).stdout
+              return set(l.split()[-1] for l in out.splitlines() if l.strip())
+
+          def called_names(runtime_dll):
+              d = open(runtime_dll, "rb").read()
+              return set(m.decode() for m in re.findall(rb"b3[A-Z][A-Za-z0-9_]+", d))
+
+          if __name__ == "__main__":
+              mode = sys.argv[1]
+              if mode == "game":
+                  g = pe_exports(sys.argv[2])
+                  print(len(g), "exports in the game's box3d.dll")
+                  print(sorted(g)[:8])
+              else:
+                  game_dll, runtime_dll, so, report = sys.argv[2:6]
+                  g = pe_exports(game_dll)
+                  s = so_exports(so)
+                  c = called_names(runtime_dll) & g          # functions the game really imports
+                  missing_called = sorted(c - s)
+                  missing_all = sorted(g - s)
+                  extra = sorted(s - g)
+                  with open(report, "w") as f:
+                      f.write("game DLL exports: %d\nAndroid .so exports: %d\n" % (len(g), len(s)))
+                      f.write("functions the game calls: %d\n" % len(c))
+                      f.write("CALLED BUT MISSING in .so: %d\n" % len(missing_called))
+                      for n in missing_called: f.write("  " + n + "\n")
+                      f.write("exported by game DLL but missing in .so: %d\n" % len(missing_all))
+                      f.write("only in .so (newer engine functions): %d\n" % len(extra))
+                  print(open(report).read())
+                  # machine readable score: number of called-but-missing functions
+                  print("SCORE=%d" % len(missing_called))
+          EOF_CMP
+          python3 -c "import ast;ast.parse(open('compare_b3.py').read())"
+          python3 compare_b3.py game game/box3d.dll
+
+      - name: Find the Android NDK
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            NDK=$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n 1)
+          fi
+          test -d "$NDK" || { echo "ERROR: Android NDK not found"; ls /usr/local/lib/android/sdk 2>/dev/null; exit 1; }
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+          echo "Using NDK $NDK"
+
+      - name: Build and compare each Box3D version
+        env:
+          REFS: ${{ inputs.refs }}
+          API: ${{ inputs.api_level }}
+        run: |
+          mkdir -p results
+          git clone --quiet https://github.com/erincatto/box3d.git box3d_src
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          BEST=""
+          BEST_SCORE=999999
+          for REF in $REFS; do
+            SAFE=$(echo "$REF" | tr '/.' '__')
+            echo "=================== $REF ==================="
+            ( cd box3d_src && git checkout --quiet "$REF" ) || { echo "cannot check out $REF"; continue; }
+            rm -rf "build_$SAFE"
+            cmake -S box3d_src -B "build_$SAFE" \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM="android-$API" \
+              -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON \
+              -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+              -DBOX3D_SAMPLES=OFF -DBOX3D_UNIT_TESTS=OFF -DBOX3D_BENCHMARKS=OFF -DBOX3D_DOCS=OFF \
+              || { echo "configure failed for $REF"; continue; }
+            cmake --build "build_$SAFE" --target box3d -j"$(nproc)" || cmake --build "build_$SAFE" -j"$(nproc)" || { echo "build failed for $REF"; continue; }
+            LIB=$(find "build_$SAFE" -name "libbox3d*.so" | head -n 1)
+            if [ -z "$LIB" ]; then
+              A=$(find "build_$SAFE" -name "libbox3d*.a" | head -n 1)
+              if [ -n "$A" ]; then
+                echo "No shared library produced, linking the static one"
+                "$BIN/aarch64-linux-android$API-clang" -shared -o "build_$SAFE/libbox3d.so" \
+                  -Wl,--whole-archive "$A" -Wl,--no-whole-archive -lm -Wl,-soname,libbox3d.so
+                LIB="build_$SAFE/libbox3d.so"
+              fi
+            fi
+            [ -n "$LIB" ] || { echo "no library produced for $REF"; continue; }
+            cp "$LIB" "results/libbox3d-$SAFE.so"
+            "$BIN/llvm-strip" --strip-unneeded "results/libbox3d-$SAFE.so" || true
+            file "results/libbox3d-$SAFE.so" || true
+            python3 compare_b3.py compare game/box3d.dll game/Box3d.Runtime.dll "results/libbox3d-$SAFE.so" "results/report-$SAFE.txt" | tee "cmp_$SAFE.log"
+            SCORE=$(grep -o "SCORE=[0-9]*" "cmp_$SAFE.log" | cut -d= -f2)
+            COMMIT=$(cd box3d_src && git rev-parse --short HEAD)
+            echo "$REF ($COMMIT): called-but-missing = $SCORE" >> results/summary.txt
+            if [ -n "$SCORE" ] && [ "$SCORE" -lt "$BEST_SCORE" ]; then BEST_SCORE=$SCORE; BEST="$SAFE"; BEST_REF="$REF"; fi
+          done
+          test -n "$BEST" || { echo "ERROR: no version could be built"; exit 1; }
+          cp "results/libbox3d-$BEST.so" results/libbox3d.so
+          echo "BEST_REF=$BEST_REF" >> "$GITHUB_ENV"
+          echo "BEST_SCORE=$BEST_SCORE" >> "$GITHUB_ENV"
+          echo "-------- summary --------"
+          cat results/summary.txt
+          echo "Best: $BEST_REF (functions the game calls that are missing: $BEST_SCORE)"
+          [ "$BEST_SCORE" = 0 ] || echo "WARNING: some functions the game calls are missing. The game may crash when it uses them."
+
+      - name: Publish to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="box3d-android-${{ github.run_number }}"
+          cp results/report-*.txt . 2>/dev/null || true
+          gh release create "$TAG" results/libbox3d.so results/summary.txt results/report-*.txt \
+            --repo ${{ github.repository }} \
+            --title "Box3D for Android (run ${{ github.run_number }})" \
+            --notes "libbox3d.so (arm64-v8a) built from Box3D $BEST_REF. Functions the game calls that this build is missing: $BEST_SCORE. Put libbox3d.so in Assets/Plugins/Android/arm64-v8a/. See summary.txt and the report files."
+          echo "Release: https://github.com/${{ github.repository }}/releases/tag/$TAG"
