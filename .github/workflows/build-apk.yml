@@ -90,6 +90,9 @@ jobs:
           sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/swift /opt/hostedtoolcache/CodeQL /usr/share/dotnet /usr/local/share/boost
           df -h /
 
+      - name: Checkout workflow helper scripts
+        uses: actions/checkout@v4
+
       - name: Download and unzip game
         env:
           GH_TOKEN: ${{ github.token }}
@@ -153,6 +156,22 @@ jobs:
             echo "GRAPHICS_API=$GRAPHICS_API"
           } >> "$GITHUB_ENV"
           echo "game=$GAME_KEY unity=$UNITY_VER scripting=$SCRIPTING arch=$ARCH minSdk=$MIN_SDK graphicsApi=$GRAPHICS_API"
+
+      - name: Install the DXBC compute shader decompiler
+        if: ${{ env.GAME_KEY == 'family_time' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the pinned DXBC compute shader decompiler
+        if: ${{ env.GAME_KEY == 'family_time' }}
+        run: |
+          mkdir -p decompiler napbat
+          git clone https://github.com/coconutbird/d3dasm.git decompiler/d3dasm
+          git -C decompiler/d3dasm checkout a292206a15daf0723d945a475c6254413eda8551
+          git clone https://github.com/napbat/cfglib.git napbat/cfglib
+          git -C napbat/cfglib checkout 1ab030353f4aaf3872ea4473ca2447f6267ba5e8
+          cargo build --release --manifest-path decompiler/d3dasm/Cargo.toml --bin d3dasm
+          test -x decompiler/d3dasm/target/release/d3dasm
+          echo "D3DASM=$GITHUB_WORKSPACE/decompiler/d3dasm/target/release/d3dasm" >> "$GITHUB_ENV"
 
       - name: Download AssetRipper
         env:
@@ -3262,6 +3281,14 @@ jobs:
           EOF_FT
           python3 fix_ft.py
 
+      - name: Recover Family Time compute shaders for Android
+        if: ${{ env.GAME_KEY == 'family_time' }}
+        run: |
+          python3 -m py_compile scripts/recover_compute_shaders.py
+          python3 scripts/recover_compute_shaders.py export/ExportedProject/Assets/ComputeShader "$D3DASM"
+          test -s export/ExportedProject/Assets/ComputeShader/android-compute-kernels.txt
+          echo "Android HLSL sources created: $(find export/ExportedProject/Assets/ComputeShader -maxdepth 1 -name '*.compute' | wc -l)"
+
       - name: Guard Input System linker against the game's legacy UserInput type
         if: ${{ env.GAME_KEY == 'family_time' && inputs.real_packages }}
         run: |
@@ -3764,6 +3791,28 @@ jobs:
                   return string.IsNullOrEmpty(v) ? fallback : v;
               }
 
+              private static void ValidateRecoveredComputeShaders()
+              {
+                  string manifest = Path.Combine(Application.dataPath, "ComputeShader/android-compute-kernels.txt");
+                  if (Env("GAME_KEY", "") != "family_time") return;
+                  if (!File.Exists(manifest)) throw new Exception("Recovered Android compute shader manifest is missing");
+                  int count = 0;
+                  foreach (string line in File.ReadAllLines(manifest))
+                  {
+                      if (string.IsNullOrWhiteSpace(line)) continue;
+                      string[] fields = line.Split('|');
+                      if (fields.Length != 2) throw new Exception("Invalid compute manifest row: " + line);
+                      ComputeShader shader = AssetDatabase.LoadAssetAtPath<ComputeShader>(fields[0]);
+                      if (shader == null) throw new Exception("Compute shader failed to import: " + fields[0]);
+                      foreach (string kernel in fields[1].Split(','))
+                      {
+                          if (!shader.HasKernel(kernel)) throw new Exception("Recovered compute kernel missing: " + fields[0] + "/" + kernel);
+                          count++;
+                      }
+                  }
+                  Console.WriteLine("CIBuild: validated recovered compute kernels = " + count);
+              }
+
               private static void ConfigureAndroid()
               {
                   bool il2cpp = Env("SCRIPTING", "Mono") == "IL2CPP";
@@ -3809,6 +3858,7 @@ jobs:
                       if (s.enabled) scenes.Add(s.path);
                   Console.WriteLine("CIBuild: scenes in build = " + scenes.Count);
                   DumpRendererAssets();
+                  ValidateRecoveredComputeShaders();
                   if (scenes.Count == 0)
                   {
                       Console.WriteLine("CIBuild: no scenes found, aborting");
@@ -3860,6 +3910,10 @@ jobs:
             -executeMethod CIBuild.BuildAndroid \
             -logFile "$PWD/unity.log"
           test -f "$APK_OUT" || { echo "ERROR: APK was not created"; exit 1; }
+          if grep -E "^Compute shader .* was not imported correctly\." unity.log; then
+            echo "ERROR: Unity omitted one or more compute shaders; refusing to publish a broken APK."
+            exit 1
+          fi
           ls -lh "$APK_OUT"
 
       - name: Show Unity errors
