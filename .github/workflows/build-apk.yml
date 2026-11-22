@@ -2857,6 +2857,91 @@ jobs:
           EOF_REMAP
           python3 remap_ft.py
 
+      - name: Rename and enable the game's DLLs for Family Time
+        if: ${{ env.GAME_KEY == 'family_time' }}
+        run: |
+          cat > rename_asm_ft.py << 'EOF_RENAME'
+          import glob, os, re, struct
+
+          proj = os.environ.get("PROJ", "export/ExportedProject")
+          plug = proj + "/Assets/Plugins"
+          OLD = b"Assembly-CSharp"
+          NEW = b"FamilyCSharp"
+
+          def strings_heap(d):
+              i = d.find(b"BSJB")
+              ver_len = struct.unpack_from("<I", d, i + 12)[0]
+              p = i + 16 + ver_len
+              _, ns = struct.unpack_from("<HH", d, p)
+              p += 4
+              for _ in range(ns):
+                  off, size = struct.unpack_from("<II", d, p)
+                  p += 8
+                  e = d.index(b"\0", p)
+                  name = d[p:e].decode()
+                  p = (e + 4) & ~3
+                  if name == "#Strings":
+                      return i + off, size
+              raise ValueError("no #Strings heap")
+
+          def patch(d, so, size, old, new):
+              heap = bytes(d[so:so + size])
+              hits = [m.start() for m in re.finditer(rb"(?<=\x00)" + re.escape(old) + rb"(?=\x00)", heap)]
+              for h in hits:
+                  d[so + h: so + h + len(old)] = new + b"\0" * (len(old) - len(new))
+              return len(hits)
+
+          # ---------------------------------------------------------------- 1. the game's own Assembly-CSharp.dll
+          # Unity builds its own assembly called "Assembly-CSharp" from the scripts in Assets (the touch controls),
+          # so two assemblies would share one name and Unity would lose the game's scripts. Give the game's a new name.
+          src = plug + "/Assembly-CSharp.dll"
+          if os.path.exists(src):
+              d = bytearray(open(src, "rb").read())
+              so, size = strings_heap(d)
+              n1 = patch(d, so, size, OLD, NEW)
+              n2 = patch(d, so, size, OLD + b".dll", NEW + b".dll")
+              assert n1 == 1, "expected exactly one assembly name entry, found %d" % n1
+              open(plug + "/FamilyCSharp.dll", "wb").write(d)
+              os.remove(src)
+              if os.path.exists(src + ".meta"):
+                  os.replace(src + ".meta", plug + "/FamilyCSharp.dll.meta")
+              for pdb in glob.glob(plug + "/Assembly-CSharp.pdb*"):
+                  os.remove(pdb)
+              print("renamed the game's assembly Assembly-CSharp -> FamilyCSharp (", n1, "name,", n2, "module entries )")
+
+              # serialized type references that mention the assembly by name
+              n_files = 0
+              for root, dirs, files in os.walk(proj + "/Assets"):
+                  for f in files:
+                      if f.endswith((".asset", ".prefab", ".unity", ".mat")):
+                          path = os.path.join(root, f)
+                          t = open(path, errors="ignore").read()
+                          t2 = re.sub(r"asm: Assembly-CSharp(?![\w-])", "asm: FamilyCSharp", t)
+                          if t2 != t:
+                              open(path, "w").write(t2)
+                              n_files += 1
+              print("updated assembly name in", n_files, "serialized files")
+          else:
+              print("no Assets/Plugins/Assembly-CSharp.dll (script export mode is not a DLL mode); nothing to rename")
+
+          # ---------------------------------------------------------------- 2. let the Editor load the game's DLLs
+          # The exported import settings turn the DLLs off in the Editor. Then scenes and renderer assets that use the
+          # game's scripts become "missing script" objects during the build and lose their data.
+          n_en = 0
+          for name in ("FamilyCSharp", "Box3d.Hybrid", "Box3d.Runtime"):
+              meta = plug + "/" + name + ".dll.meta"
+              if not os.path.exists(meta):
+                  continue
+              t = open(meta, errors="ignore").read()
+              t2 = re.sub(r"(Editor:\s*\n\s*enabled:) 0", r"\1 1", t)
+              if t2 != t:
+                  open(meta, "w").write(t2)
+                  n_en += 1
+                  print("Editor loading turned on for", name)
+          print("Editor loading turned on for", n_en, "game DLLs")
+          EOF_RENAME
+          python3 rename_asm_ft.py
+
       - name: Fix decompiled code for Family Time
         if: ${{ env.GAME_KEY == 'family_time' }}
         run: |
@@ -3506,25 +3591,25 @@ jobs:
           		}
           		if (usePad && pad != null)
           		{
-          			InputState.Change(pad.leftStick, joyVec);
-          			InputState.Change(pad.rightStick, Vector2.ClampMagnitude(lookDelta * LookPadScale, 1f));
-          			for (int i = 0; i < buttons.Count; i++)
-          			{
-          				InputState.Change(pad[buttons[i].pad], held.Contains(buttons[i]) ? 1f : 0f);
-          			}
+          			GamepadState gs = new GamepadState();
+          			gs.leftStick = joyVec;
+          			gs.rightStick = Vector2.ClampMagnitude(lookDelta * LookPadScale, 1f);
+          			foreach (Btn b in held) gs = gs.WithButton(b.pad);
+          			InputSystem.QueueStateEvent(pad, gs);
           		}
           		if (useKb && kb != null && mouse != null)
           		{
-          			InputState.Change(kb[Key.W], joyVec.y > 0.35f ? 1f : 0f);
-          			InputState.Change(kb[Key.S], joyVec.y < -0.35f ? 1f : 0f);
-          			InputState.Change(kb[Key.D], joyVec.x > 0.35f ? 1f : 0f);
-          			InputState.Change(kb[Key.A], joyVec.x < -0.35f ? 1f : 0f);
-          			for (int i = 0; i < buttons.Count; i++)
-          			{
-          				InputState.Change(kb[buttons[i].key], held.Contains(buttons[i]) ? 1f : 0f);
-          			}
-          			InputState.Change(mouse.position, new Vector2(Screen.width / 2f, Screen.height / 2f));
-          			InputState.Change(mouse.delta, lookDelta * LookMouseScale);
+          			List<Key> keys = new List<Key>();
+          			if (joyVec.y > 0.35f) keys.Add(Key.W);
+          			if (joyVec.y < -0.35f) keys.Add(Key.S);
+          			if (joyVec.x > 0.35f) keys.Add(Key.D);
+          			if (joyVec.x < -0.35f) keys.Add(Key.A);
+          			foreach (Btn b in held) keys.Add(b.key);
+          			InputSystem.QueueStateEvent(kb, new KeyboardState(keys.ToArray()));
+          			MouseState ms = new MouseState();
+          			ms.position = new Vector2(Screen.width / 2f, Screen.height / 2f);
+          			ms.delta = lookDelta * LookMouseScale;
+          			InputSystem.QueueStateEvent(mouse, ms);
           		}
           	}
 
@@ -3652,6 +3737,14 @@ jobs:
           #endif
                   PlayerSettings.Android.targetArchitectures = (arch == "ARM64") ? AndroidArchitecture.ARM64 : AndroidArchitecture.ARMv7;
                   PlayerSettings.Android.minSdkVersion = (AndroidSdkVersions)minSdk;
+                  if (Env("GAME_KEY", "") == "family_time")
+                  {
+                      PlayerSettings.defaultInterfaceOrientation = UIOrientation.AutoRotation;
+                      PlayerSettings.allowedAutorotateToPortrait = false;
+                      PlayerSettings.allowedAutorotateToPortraitUpsideDown = false;
+                      PlayerSettings.allowedAutorotateToLandscapeLeft = true;
+                      PlayerSettings.allowedAutorotateToLandscapeRight = true;
+                  }
                   if (api == "OpenGLES3" || api == "Vulkan" || api == "Vulkan_GLES3")
                   {
                       UnityEngine.Rendering.GraphicsDeviceType[] apis;
