@@ -2960,6 +2960,25 @@ jobs:
                   # the alias must not hide an explicit Unity.Mathematics Random: keep it simple and only add what is used
                   open(f, "w").write(t.replace("using UnityEngine;", "using UnityEngine;\n" + "\n".join(add), 1))
                   print("alias added in", os.path.relpath(f, proj), ":", add)
+
+          # ---------------------------------------------------------------- 5. keep the game's DLLs away from Unity's packages
+          # Precompiled DLLs in Assets/Plugins are visible to every package by default. The game has its own
+          # global class called "Tools", which then hides UnityEditor.Tools inside the URP editor code.
+          # "isExplicitlyReferenced: 1" turns Auto Referenced off. Nothing here needs to compile against these DLLs.
+          n_meta = 0
+          for meta in glob.glob(proj + "/Assets/Plugins/*.dll.meta"):
+              t = read(meta)
+              if re.search(r"^\s*isExplicitlyReferenced:\s*1\s*$", t, re.M):
+                  continue
+              if re.search(r"^(\s*)isExplicitlyReferenced:\s*0\s*$", t, re.M):
+                  t2 = re.sub(r"^(\s*)isExplicitlyReferenced:\s*0\s*$", r"\1isExplicitlyReferenced: 1", t, flags=re.M)
+              elif "isOverridable:" in t:
+                  t2 = re.sub(r"^(\s*)isOverridable:(.*)$", r"\1isOverridable:\2\n\1isExplicitlyReferenced: 1", t, count=1, flags=re.M)
+              else:
+                  continue
+              open(meta, "w").write(t2)
+              n_meta += 1
+          print("turned off Auto Referenced for", n_meta, "plugin DLLs")
           EOF_CSFIX
           python3 csfix_ft.py
 
