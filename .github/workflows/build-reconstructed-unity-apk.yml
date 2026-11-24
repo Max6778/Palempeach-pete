@@ -1,0 +1,103 @@
+name: Build reconstructed Mono Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_tag:
+        description: Release tag containing the Unity project ZIP
+        required: true
+        default: bbplus-unity-project
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/swift /opt/hostedtoolcache/CodeQL /usr/share/dotnet /usr/local/share/boost
+          df -h /
+
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+
+      - name: Download reconstructed Unity project
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROJECT_TAG: ${{ inputs.project_tag }}
+        run: |
+          gh release download "$PROJECT_TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern "bbplus-android-mono-unityproject.zip" \
+            --dir .
+          unzip -q bbplus-android-mono-unityproject.zip
+          test -f UnityProject/ProjectSettings/ProjectVersion.txt
+          test -f UnityProject/Assets/Editor/CIAndroidBuild.cs
+          echo "Unity project size:"
+          du -sh UnityProject
+
+      - name: Install Unity with Android
+        id: unity-setup
+        uses: RageAgainstThePixel/unity-setup@v2
+        with:
+          version-file: UnityProject/ProjectSettings/ProjectVersion.txt
+          build-targets: Android
+          hub-version: '3.14.3'
+          cache-installation: true
+
+      - name: Activate Unity Personal license
+        uses: RageAgainstThePixel/activate-unity-license@v2
+        with:
+          license: Personal
+          username: ${{ secrets.UNITY_EMAIL }}
+          password: ${{ secrets.UNITY_PASSWORD }}
+
+      - name: Build development APK
+        env:
+          UNITY_EDITOR_PATH: ${{ steps.unity-setup.outputs.unity-editor-path }}
+        run: |
+          UNITY_BIN="$UNITY_EDITOR_PATH"
+          if [ -d "$UNITY_BIN" ]; then
+            if [ -x "$UNITY_BIN/Unity" ]; then
+              UNITY_BIN="$UNITY_BIN/Unity"
+            elif [ -x "$UNITY_BIN/Editor/Unity" ]; then
+              UNITY_BIN="$UNITY_BIN/Editor/Unity"
+            fi
+          fi
+          if [ ! -x "$UNITY_BIN" ]; then
+            UNITY_BIN="$(find "$HOME/Unity/Hub/Editor" /opt/unity -path '*/Editor/Unity' -type f -executable -print -quit 2>/dev/null || true)"
+          fi
+          test -x "$UNITY_BIN" || { echo "Unity executable not found; setup output was: $UNITY_EDITOR_PATH"; exit 1; }
+          mkdir -p out
+          "$UNITY_BIN" -batchmode -nographics -quit \
+            -projectPath "$GITHUB_WORKSPACE/UnityProject" \
+            -buildTarget Android \
+            -executeMethod CIAndroidBuild.Build \
+            -logFile "$GITHUB_WORKSPACE/out/unity-editor.log"
+          test -s out/bbplus-reconstructed-debug.apk
+
+      - name: Upload build logs and APK artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bbplus-reconstructed-android-build
+          path: |
+            out/bbplus-reconstructed-debug.apk
+            out/unity-editor.log
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: Publish APK release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="bbplus-android-mono-build-${{ github.run_number }}"
+          gh release create "$TAG" out/bbplus-reconstructed-debug.apk \
+            --repo "${{ github.repository }}" \
+            --title "BB+ Android Mono build ${{ github.run_number }}" \
+            --notes "Development APK built from the reconstructed Unity 2021.3.58f1 project by GitHub Actions. Android ARM64, Mono backend."
+
