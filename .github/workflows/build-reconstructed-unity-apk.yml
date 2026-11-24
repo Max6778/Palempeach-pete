@@ -36,9 +36,9 @@ jobs:
           unzip -q bbplus-android-mono-unityproject.zip
           test -f UnityProject/ProjectSettings/ProjectVersion.txt
           test -f UnityProject/Assets/Editor/CIAndroidBuild.cs
-          # Unity 2021.3.58f1 is Extended LTS and requires an Enterprise/Industry license.
+          # Unity 2021.3.49f1 is Extended LTS and requires an Enterprise/Industry license.
           # Use the final Personal-compatible 2021.3 patch to compile this project.
-          sed -i 's/^m_EditorVersion:.*/m_EditorVersion: 2021.3.49f1/' UnityProject/ProjectSettings/ProjectVersion.txt
+          sed -i 's/^m_EditorVersion:.*/m_EditorVersion: 2021.3.45f1/' UnityProject/ProjectSettings/ProjectVersion.txt
           echo "Unity project size:"
           du -sh UnityProject
 
@@ -47,7 +47,7 @@ jobs:
         uses: RageAgainstThePixel/unity-setup@v2
         with:
           version-file: None
-          unity-version: 2021.3.49f1
+          unity-version: 2021.3.45f1
           build-targets: Android
           hub-version: '3.14.3'
           cache-installation: true
@@ -103,5 +103,5 @@ jobs:
           gh release create "$TAG" out/bbplus-reconstructed-debug.apk \
             --repo "${{ github.repository }}" \
             --title "BB+ Android Mono build ${{ github.run_number }}" \
-            --notes "Development APK built from the reconstructed project using Unity 2021.3.49f1. Android ARM64, Mono backend."
+            --notes "Development APK built from the reconstructed project using Unity 2021.3.45f1. Android ARM64, Mono backend."
 
