@@ -59,6 +59,13 @@ jobs:
           username: ${{ secrets.UNITY_EMAIL }}
           password: ${{ secrets.UNITY_PASSWORD }}
 
+      - name: Install legacy OpenSSL runtime for Unity compiler
+        run: |
+          curl --fail --silent --show-error --location \
+            https://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2.24_amd64.deb \
+            --output /tmp/libssl1.1.deb
+          sudo dpkg -i /tmp/libssl1.1.deb
+
       - name: Build development APK
         env:
           UNITY_EDITOR_PATH: ${{ steps.unity-setup.outputs.unity-editor-path }}
