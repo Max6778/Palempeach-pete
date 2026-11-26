@@ -111,6 +111,8 @@ jobs:
             -buildTarget Android \
             -executeMethod CIAndroidBuild.Build \
             -logFile "$GITHUB_WORKSPACE/out/unity-editor.log"
+          # Safety net: older project versions wrote the APK to UnityProject/out
+          [ -s out/bbplus-reconstructed-debug.apk ] || { [ -s UnityProject/out/bbplus-reconstructed-debug.apk ] && cp UnityProject/out/bbplus-reconstructed-debug.apk out/; }
           test -s out/bbplus-reconstructed-debug.apk
 
       - name: Upload build logs and APK artifact
@@ -134,5 +136,5 @@ jobs:
           gh release create "$TAG" out/bbplus-reconstructed-debug.apk \
             --repo "${{ github.repository }}" \
             --title "BB+ Android Mono build ${{ github.run_number }}" \
-            --notes "Development APK built from the reconstructed project using Unity 2021.3.45f1. Android ARM64, Mono backend."
+            --notes "Development APK built from the reconstructed project using Unity 2021.3.45f1. Android ARMv7 (32-bit), Mono backend."
 
