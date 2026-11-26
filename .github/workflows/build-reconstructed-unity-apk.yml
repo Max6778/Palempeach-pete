@@ -66,6 +66,29 @@ jobs:
             --output /tmp/libssl1.1.deb
           sudo dpkg -i /tmp/libssl1.1.deb
 
+      - name: Swap PC plugin DLLs for real URP/TMP/UGUI packages
+        run: python3 tools/ci_package_remap.py prepare UnityProject
+
+      - name: Resolve Unity packages
+        env:
+          UNITY_EDITOR_PATH: ${{ steps.unity-setup.outputs.unity-editor-path }}
+        run: |
+          UNITY_BIN="$UNITY_EDITOR_PATH"
+          [ -d "$UNITY_BIN" ] && { [ -x "$UNITY_BIN/Unity" ] && UNITY_BIN="$UNITY_BIN/Unity" || UNITY_BIN="$UNITY_BIN/Editor/Unity"; }
+          [ -x "$UNITY_BIN" ] || UNITY_BIN="$(find "$HOME/Unity/Hub/Editor" /opt/unity -path '*/Editor/Unity' -type f -executable -print -quit 2>/dev/null || true)"
+          mkdir -p out
+          # Compile errors are expected here (references not remapped yet); we only need the package cache.
+          "$UNITY_BIN" -batchmode -nographics -quit -projectPath "$GITHUB_WORKSPACE/UnityProject" \
+            -logFile "$GITHUB_WORKSPACE/out/unity-resolve.log" || true
+          test -d UnityProject/Library/PackageCache
+          echo "UNITY_ROOT=$(dirname "$UNITY_BIN")" >> "$GITHUB_ENV"
+
+      - name: Re-point script and shader references at the packages
+        run: |
+          python3 tools/ci_package_remap.py remap UnityProject \
+            UnityProject/Library/PackageCache \
+            "$UNITY_ROOT/Data/Resources/PackageManager/BuiltInPackages"
+
       - name: Build development APK
         env:
           UNITY_EDITOR_PATH: ${{ steps.unity-setup.outputs.unity-editor-path }}
@@ -98,6 +121,7 @@ jobs:
           path: |
             out/bbplus-reconstructed-debug.apk
             out/unity-editor.log
+            out/unity-resolve.log
           if-no-files-found: warn
           compression-level: 0
 
