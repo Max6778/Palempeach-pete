@@ -7,6 +7,14 @@ on:
         description: Release tag containing the Unity project ZIP
         required: true
         default: bbplus-unity-project
+      graphics_api:
+        description: Android graphics API for controlled rendering A/B builds
+        required: true
+        type: choice
+        options:
+          - OpenGLES3
+          - Vulkan
+        default: OpenGLES3
 
 permissions:
   contents: write
@@ -98,6 +106,7 @@ jobs:
       - name: Build development APK
         env:
           UNITY_EDITOR_PATH: ${{ steps.unity-setup.outputs.unity-editor-path }}
+          BBPLUS_GRAPHICS_API: ${{ inputs.graphics_api }}
         run: |
           UNITY_BIN="$UNITY_EDITOR_PATH"
           if [ -d "$UNITY_BIN" ]; then
