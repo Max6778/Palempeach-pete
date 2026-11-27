@@ -162,7 +162,10 @@ def prepare(project: Path) -> None:
     rewired_tools = project / "Assets/Scripts/Assembly-CSharp/Rewired/Utils/ExternalTools.cs"
     if rewired_tools.is_file():
         text = rewired_tools.read_text(errors="ignore")
-        text = text.replace("using Rewired.Utils.Platforms.Windows;\n", "")
+        text = text.replace(
+            "using Rewired.Utils.Platforms.Windows;",
+            "using Rewired.Utils.Platforms.Android;",
+        )
         rewired_tools.write_text(text)
     print(f"prepared; removed DLLs: {removed}")
 

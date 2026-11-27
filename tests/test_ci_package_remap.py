@@ -40,7 +40,6 @@ class PackageRemapTests(unittest.TestCase):
             rewired.parent.mkdir(parents=True)
             rewired.write_text(
                 "using Rewired.Utils.Platforms.Windows;\n"
-                "using Rewired.Utils.Platforms.Android;\n"
                 "class ExternalTools {}\n"
             )
 
