@@ -1,0 +1,89 @@
+name: Recover PC shader disassembly
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Download the PC game and AssetRipper
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force game, assetripper | Out-Null
+          gh release download game1 --repo $env:GITHUB_REPOSITORY --pattern Game.zip --dir .
+          Expand-Archive -LiteralPath Game.zip -DestinationPath game -Force
+          gh release download 2.0.0 --repo AssetRipper/AssetRipper --pattern AssetRipper_win_x64.zip --dir .
+          Expand-Archive -LiteralPath AssetRipper_win_x64.zip -DestinationPath assetripper -Force
+          $exe = Get-ChildItem assetripper -Recurse -File -Filter AssetRipper.GUI.Free.exe | Select-Object -First 1
+          if (-not $exe) { throw 'AssetRipper.GUI.Free.exe was not found in the Windows release.' }
+          "ASSET_RIPPER_EXE=$($exe.FullName)" >> $env:GITHUB_ENV
+          $data = Get-ChildItem game -Recurse -File -Filter globalgamemanagers | Select-Object -First 1
+          if (-not $data) { throw 'The PC game data directory is missing globalgamemanagers.' }
+          "GAME_ROOT=$($data.Directory.FullName)" >> $env:GITHUB_ENV
+
+      - name: Export DirectX shader disassembly
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath $env:ASSET_RIPPER_EXE `
+            -ArgumentList @('--headless', '--port', '5000', '--log-path', "$PWD\assetripper.log") `
+            -PassThru -RedirectStandardOutput "$PWD\assetripper-stdout.log" -RedirectStandardError "$PWD\assetripper-stderr.log"
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              try { Invoke-WebRequest -Uri http://127.0.0.1:5000 -TimeoutSec 3 | Out-Null; $ready = $true; break }
+              catch { Start-Sleep -Seconds 2 }
+            }
+            if (-not $ready) { throw 'AssetRipper did not start its local API.' }
+            $settings = @{ ScriptExportMode = 'Hybrid'; ShaderExportMode = 'Disassembly' }
+            Invoke-WebRequest -Uri http://127.0.0.1:5000/Settings/Update -Method Post -Body $settings -TimeoutSec 30 | Out-Null
+            Invoke-WebRequest -Uri http://127.0.0.1:5000/LoadFolder -Method Post -Body @{ Path = $env:GAME_ROOT } -TimeoutSec 900 | Out-Null
+            Invoke-WebRequest -Uri http://127.0.0.1:5000/Export/UnityProject -Method Post -Body @{ Path = "$PWD\export" } -TimeoutSec 3600 | Out-Null
+          }
+          finally {
+            if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+          }
+
+      - name: Package shader sources and inventory
+        shell: pwsh
+        run: |
+          $assets = (Resolve-Path 'export\ExportedProject\Assets').Path
+          $destination = Join-Path $PWD 'shader-export'
+          New-Item -ItemType Directory -Force $destination | Out-Null
+          $shaderFiles = Get-ChildItem $assets -Recurse -File -Filter '*.shader'
+          if ($shaderFiles.Count -eq 0) { throw 'AssetRipper exported no shader files.' }
+          $rows = foreach ($file in $shaderFiles) {
+            $relative = $file.FullName.Substring($assets.Length).TrimStart('\')
+            $target = Join-Path $destination $relative
+            New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
+            Copy-Item -LiteralPath $file.FullName -Destination $target
+            $meta = "$($file.FullName).meta"
+            if (Test-Path $meta) { Copy-Item -LiteralPath $meta -Destination "$target.meta" }
+            $text = Get-Content -LiteralPath $file.FullName -Raw
+            $name = if ($text -match 'Shader\s+"([^"]+)"') { $Matches[1] } else { '(name not parsed)' }
+            $mode = if ($text.Contains('DummyShaderTextExporter')) { 'dummy' } else { 'non-dummy' }
+            "{0}`t{1}`t{2}`t{3}" -f $relative, $file.Length, $mode, $name
+          }
+          $rows | Set-Content -Encoding utf8 shader-inventory.tsv
+          Compress-Archive -Path "$destination\*" -DestinationPath pc-shader-disassembly.zip -Force
+          Write-Host "Exported $($shaderFiles.Count) shaders."
+          Get-Content shader-inventory.tsv | Select-Object -First 20
+
+      - name: Upload shader artifact and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pc-shader-disassembly
+          path: |
+            pc-shader-disassembly.zip
+            shader-inventory.tsv
+            assetripper.log
+            assetripper-stdout.log
+            assetripper-stderr.log
+          if-no-files-found: warn
