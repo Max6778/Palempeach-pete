@@ -29,6 +29,12 @@ GUID_RE = re.compile(r"^guid:\s*([0-9a-fA-F]{32})\s*$", re.MULTILINE)
 NAMESPACE_RE = re.compile(r"\bnamespace\s+([\w.]+)")
 TYPE_RE = re.compile(r"\b(?:class|struct|interface|enum)\s+(\w+)")
 SHADER_RE = re.compile(r"\bShader\s+\"([^\"]+)\"")
+# AssetRipper recorded these kMotion aliases, while URP 12.1 ships the same
+# implementations under the package's Universal Render Pipeline namespace.
+SHADER_ALIASES = {
+    "Hidden/kMotion/CameraMotionVectors": "Hidden/Universal Render Pipeline/CameraMotionVectors",
+    "Hidden/kMotion/ObjectMotionVectors": "Hidden/Universal Render Pipeline/ObjectMotionVectors",
+}
 GUID_REF_RE = re.compile(r"guid:\s*([0-9a-fA-F]{32})")
 TEXT_ASSET_SUFFIXES = {".asset", ".prefab", ".unity", ".mat", ".renderTexture", ".shadervariants"}
 
@@ -115,8 +121,12 @@ def build_shader_guid_map(project: Path, target_index: dict[str, str]) -> dict[s
         except OSError:
             continue
         old_guid = read_guid(shader.with_suffix(shader.suffix + ".meta"))
-        if match and old_guid and match.group(1) in target_index:
-            new_guid = target_index[match.group(1)]
+        if match and old_guid:
+            shader_name = match.group(1)
+            package_name = SHADER_ALIASES.get(shader_name, shader_name)
+            if package_name not in target_index:
+                continue
+            new_guid = target_index[package_name]
             if old_guid != new_guid:
                 mapping[old_guid] = new_guid
     return mapping
@@ -138,6 +148,56 @@ def replace_references(project: Path, mapping: dict[str, str]) -> int:
             path.write_text(updated)
             changed += 1
     return changed
+
+
+def remove_replaced_shader_stubs(project: Path, package_shaders: dict[str, str]) -> int:
+    """Remove exported dummy declarations after references point at package sources.
+
+    Keeping two shaders with the same ShaderLab name makes Shader.Find ambiguous,
+    even when serialized material references have already been remapped.
+    """
+    removed = 0
+    for shader in (project / "Assets").rglob("*.shader"):
+        try:
+            match = SHADER_RE.search(shader.read_text(errors="ignore"))
+        except OSError:
+            continue
+        if not match:
+            continue
+        shader_name = match.group(1)
+        if shader_name not in package_shaders and SHADER_ALIASES.get(shader_name) not in package_shaders:
+            continue
+        shader.unlink()
+        meta = shader.with_suffix(shader.suffix + ".meta")
+        if meta.exists():
+            meta.unlink()
+        removed += 1
+    return removed
+
+
+def unresolved_package_shader_stubs(project: Path, package_shaders: dict[str, str]) -> list[str]:
+    package_prefixes = (
+        "Hidden/Universal ",
+        "Hidden/Universal/",
+        "Hidden/Core/",
+        "Hidden/Shader Graph/",
+        "Hidden/TerrainEngine/",
+        "TextMeshPro/",
+    )
+    unresolved: set[str] = set()
+    for shader in (project / "Assets").rglob("*.shader"):
+        try:
+            text = shader.read_text(errors="ignore")
+            match = SHADER_RE.search(text)
+        except OSError:
+            continue
+        if not match or "DummyShaderTextExporter" not in text:
+            continue
+        name = match.group(1)
+        package_name = SHADER_ALIASES.get(name, name)
+        if name.startswith(package_prefixes) and package_name not in package_shaders:
+            unresolved.add(name)
+    return sorted(unresolved)
 
 
 def prepare(project: Path) -> None:
@@ -177,12 +237,16 @@ def remap(project: Path, package_cache: Path, builtin_packages: Path) -> None:
     target_shaders = shader_guid_index(roots)
     shader_mapping = build_shader_guid_map(project, target_shaders)
     changed = replace_references(project, script_mapping | shader_mapping)
+    removed_shader_stubs = remove_replaced_shader_stubs(project, target_shaders)
+    unresolved_shaders = unresolved_package_shader_stubs(project, target_shaders)
     print(
         "package roots found: "
         f"{[root.name.split('@', 1)[0] for root in roots]} | "
         f"script classes: {len(target_scripts)} | shaders: {len(target_shaders)}"
     )
     print(f"dummy shaders replaced by package shaders: {len(shader_mapping)}")
+    print(f"duplicate package shader stubs removed: {removed_shader_stubs}")
+    print(f"unresolved package dummy shader stubs: {unresolved_shaders}")
     print(f"script refs remapped: {len(script_mapping)} | shader refs remapped: {len(shader_mapping)}")
     print(f"serialized assets updated: {changed}")
 
