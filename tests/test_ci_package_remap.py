@@ -1,5 +1,6 @@
 import subprocess
 import tempfile
+import json
 import unittest
 from pathlib import Path
 
@@ -28,6 +29,29 @@ class PackageRemapTests(unittest.TestCase):
 
             self.assertFalse((plugins / "Unity.RenderPipelines.Universal.Runtime.dll").exists())
             self.assertTrue((plugins / "Rewired_Core.dll").exists())
+
+    def test_prepare_adds_urp_package_and_removes_windows_only_rewired_import(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "UnityProject"
+            manifest = project / "Packages" / "manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text('{"dependencies": {"com.unity.textmeshpro": "3.0.6"}}')
+            rewired = project / "Assets/Scripts/Assembly-CSharp/Rewired/Utils/ExternalTools.cs"
+            rewired.parent.mkdir(parents=True)
+            rewired.write_text(
+                "using Rewired.Utils.Platforms.Windows;\n"
+                "using Rewired.Utils.Platforms.Android;\n"
+                "class ExternalTools {}\n"
+            )
+
+            self.run_helper("prepare", project)
+
+            dependencies = json.loads(manifest.read_text())["dependencies"]
+            self.assertEqual(dependencies["com.unity.render-pipelines.universal"], "12.1.15")
+            self.assertEqual(dependencies["com.unity.ugui"], "1.0.0")
+            contents = rewired.read_text()
+            self.assertNotIn("Rewired.Utils.Platforms.Windows", contents)
+            self.assertIn("Rewired.Utils.Platforms.Android", contents)
 
     def test_remap_repoints_package_script_and_shader_guids(self):
         old_script_guid = "11111111111111111111111111111111"

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import json
 import sys
 from pathlib import Path
 
@@ -151,6 +152,18 @@ def prepare(project: Path) -> None:
                 if meta.exists():
                     meta.unlink()
                 removed.append(dll_name.removesuffix(".dll"))
+    manifest = project / "Packages" / "manifest.json"
+    if manifest.is_file():
+        data = json.loads(manifest.read_text())
+        dependencies = data.setdefault("dependencies", {})
+        dependencies["com.unity.render-pipelines.universal"] = "12.1.15"
+        dependencies["com.unity.ugui"] = "1.0.0"
+        manifest.write_text(json.dumps(data, indent=2) + "\n")
+    rewired_tools = project / "Assets/Scripts/Assembly-CSharp/Rewired/Utils/ExternalTools.cs"
+    if rewired_tools.is_file():
+        text = rewired_tools.read_text(errors="ignore")
+        text = text.replace("using Rewired.Utils.Platforms.Windows;\n", "")
+        rewired_tools.write_text(text)
     print(f"prepared; removed DLLs: {removed}")
 
 
